@@ -7,6 +7,11 @@ This guide will help you set up and run the Azure-powered voice agent.
 ✅ Virtual environment created and activated
 ✅ Dependencies installed (livekit-agents, azure plugin)
 
+You can use claude code to install venv and the folder as editable package. 
+Then try to run azure agent py in claude code. it will help you install dependencies.
+python azure_agent.py download-files
+python azure_agent.py console
+
 ## Required Azure Services
 
 You need the following Azure services set up:
