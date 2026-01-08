@@ -210,6 +210,8 @@ class TTS(tts.TTS):
         # Shared synthesizer and warmup state across all streams
         self._synthesizer: speechsdk.SpeechSynthesizer | None = None
         self._warmup_done = False
+        self._last_synthesis_time: float = 0  # Track last successful synthesis
+        self._connection_timeout = 300.0  # 5 minutes idle timeout (conservative)
 
     @property
     def model(self) -> str:
@@ -307,7 +309,6 @@ class ChunkedStream(tts.ChunkedStream):
         }
         if self._opts.auth_token:
             headers["Authorization"] = f"Bearer {self._opts.auth_token}"
-
         elif self._opts.subscription_key:
             headers["Ocp-Apim-Subscription-Key"] = self._opts.subscription_key
 
@@ -319,12 +320,22 @@ class ChunkedStream(tts.ChunkedStream):
         )
 
         try:
+            ssml_content = self._build_ssml()
+            logger.debug(f"[Azure TTS] SSML length: {len(ssml_content)} bytes")
+            
             async with self._tts._ensure_session().post(
                 url=self._opts.get_endpoint_url(),
                 headers=headers,
-                data=self._build_ssml(),
+                data=ssml_content,
                 timeout=aiohttp.ClientTimeout(total=30, sock_connect=self._conn_options.timeout),
             ) as resp:
+                logger.debug(f"[Azure TTS] Response status: {resp.status}")
+                logger.debug(f"[Azure TTS] Response headers: {dict(resp.headers)}")
+                
+                if resp.status != 200:
+                    response_text = await resp.text()
+                    logger.error(f"[Azure TTS] Error response body: {response_text}")
+                
                 resp.raise_for_status()
                 async for data, _ in resp.content.iter_chunks():
                     output_emitter.push(data)
@@ -332,6 +343,7 @@ class ChunkedStream(tts.ChunkedStream):
         except asyncio.TimeoutError:
             raise APITimeoutError() from None
         except aiohttp.ClientResponseError as e:
+            logger.error(f"[Azure TTS] HTTP error: {e.status} - {e.message}")
             raise APIStatusError(
                 message=e.message,
                 status_code=e.status,
@@ -366,21 +378,54 @@ class SynthesizeStream(tts.SynthesizeStream):
         except:
             pass
         self._tts._synthesizer = self._create_synthesizer()
-        self._tts._warmup_done = False
-        self._warmup_synthesizer()
+        # DO NOT reset warmup_done flag - we don't want to warmup again during retry
+        # The warmup is only needed once per TTS instance, not per synthesizer
+        # Resetting it here causes segment state issues when warmup is called during retry
+        logger.debug("[RECREATE] synthesizer recreated, skipping warmup to avoid segment state issues")
+    # def _check_connection_health(self) -> bool:
+    #     """Check if the connection might be stale and needs recreation."""
+    #     import time
+        
+    #     if not self._tts._synthesizer:
+    #         logger.debug("no synthesizer exists, needs creation")
+    #         return False
+            
+    #     if self._tts._last_synthesis_time == 0:
+    #         # Never used, should be fine
+    #         return True
+            
+    #     time_since_last_use = time.time() - self._tts._last_synthesis_time
+        
+    #     if time_since_last_use > self._tts._connection_timeout:
+    #         logger.warning(
+    #             "azure tts connection may be stale, will recreate",
+    #             extra={
+    #                 "idle_time": f"{time_since_last_use:.1f}s",
+    #                 "timeout_threshold": f"{self._tts._connection_timeout:.1f}s"
+    #             }
+    #         )
+    #         return False
+            
+    #     return True
+
 
 
     def _create_synthesizer(self) -> speechsdk.SpeechSynthesizer:
         """Create and configure the Azure Speech synthesizer."""
+        logger.info("[CREATE_SYNTH] creating new Azure Speech synthesizer")
+        
         # Build WebSocket v2 endpoint
         if self._opts.speech_endpoint:
             endpoint = self._opts.speech_endpoint.replace(
                 "/cognitiveservices/v1", "/cognitiveservices/websocket/v2"
             )
+            logger.info(f"[CREATE_SYNTH] using custom endpoint: {endpoint}")
         else:
             endpoint = f"wss://{self._opts.region}.tts.speech.microsoft.com/cognitiveservices/websocket/v2"
+            logger.info(f"[CREATE_SYNTH] using default endpoint for region: {self._opts.region}")
 
         # Create speech config
+        logger.debug("[CREATE_SYNTH] creating speech config")
         speech_config = speechsdk.SpeechConfig(
             endpoint=endpoint,
             subscription=self._opts.subscription_key or "",
@@ -388,48 +433,96 @@ class SynthesizeStream(tts.SynthesizeStream):
 
         # Set deployment ID if provided
         if self._opts.deployment_id:
+            logger.info(f"[CREATE_SYNTH] setting deployment ID: {self._opts.deployment_id}")
             speech_config.endpoint_id = self._opts.deployment_id
 
         # Set voice and output format
+        logger.info(f"[CREATE_SYNTH] setting voice: {self._opts.voice}")
         speech_config.speech_synthesis_voice_name = self._opts.voice
         
         # Use SDK format if available
         if self._opts.sample_rate in SDK_OUTPUT_FORMATS:
-            speech_config.set_speech_synthesis_output_format(
-                SDK_OUTPUT_FORMATS[self._opts.sample_rate]
-            )
+            format_name = SDK_OUTPUT_FORMATS[self._opts.sample_rate]
+            logger.info(f"[CREATE_SYNTH] setting output format for {self._opts.sample_rate}Hz: {format_name}")
+            speech_config.set_speech_synthesis_output_format(format_name)
         else:
+            logger.info(f"[CREATE_SYNTH] using default 24kHz format (requested: {self._opts.sample_rate}Hz)")
             # Default to 24kHz raw format
             speech_config.set_speech_synthesis_output_format(
                 speechsdk.SpeechSynthesisOutputFormat.Raw24Khz16BitMonoPcm
             )
 
         # Create synthesizer (no audio config - we'll use events)
-        return speechsdk.SpeechSynthesizer(
+        logger.info("[CREATE_SYNTH] creating synthesizer instance")
+        synthesizer = speechsdk.SpeechSynthesizer(
             speech_config=speech_config, audio_config=None
         )
+        logger.info("[CREATE_SYNTH] synthesizer created successfully")
+        return synthesizer
 
     def _warmup_synthesizer(self) -> None:
         """Warm up the synthesizer by synthesizing a short text."""
         if self._tts._warmup_done:
+            logger.debug("azure tts synthesizer already warmed up, skipping")
             return
 
         import time
 
         # Warm-up: synthesize a short text first to establish connection
-        logger.info("warming up azure tts synthesizer")
+        logger.info("warming up azure tts synthesizer - starting warmup process")
         warmup_start = time.time()
-        warmup_request = speechsdk.SpeechSynthesisRequest(
-            input_type=speechsdk.SpeechSynthesisRequestInputType.TextStream
-        )
-        warmup_task = self._tts._synthesizer.speak_async(warmup_request)
-        warmup_request.input_stream.write("Warm up.")
-        warmup_request.input_stream.close()
-        warmup_result = warmup_task.get()
-        warmup_time = time.time() - warmup_start
-        logger.info("azure tts warmup completed", extra={"duration": f"{warmup_time:.3f}s"})
+        
+        try:
+            logger.debug("[WARMUP] creating warmup synthesis request")
+            warmup_request = speechsdk.SpeechSynthesisRequest(
+                input_type=speechsdk.SpeechSynthesisRequestInputType.TextStream
+            )
+            
+            logger.debug("[WARMUP] starting async warmup synthesis")
+            warmup_task = self._tts._synthesizer.speak_async(warmup_request)
+            
+            logger.debug("[WARMUP] writing warmup text to input stream")
+            warmup_request.input_stream.write("Warm up.")
+            warmup_request.input_stream.close()
+            
+            logger.debug("[WARMUP] waiting for warmup synthesis result (this may take several seconds)")
+            warmup_result = warmup_task.get()
+            
+            warmup_time = time.time() - warmup_start
+            
+            if warmup_result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
+                logger.info(
+                    "[WARMUP] azure tts warmup completed successfully",
+                    extra={
+                        "duration": f"{warmup_time:.3f}s",
+                        "audio_length": len(warmup_result.audio_data) if warmup_result.audio_data else 0
+                    }
+                )
+            else:
+                logger.warning(
+                    "[WARMUP] azure tts warmup completed with unexpected reason",
+                    extra={
+                        "duration": f"{warmup_time:.3f}s",
+                        "reason": warmup_result.reason,
+                        "cancellation_details": warmup_result.cancellation_details if hasattr(warmup_result, 'cancellation_details') else None
+                    }
+                )
 
-        self._tts._warmup_done = True
+            logger.debug("[WARMUP] warmup completed, setting warmup_done flag")
+            self._tts._warmup_done = True
+            
+        except Exception as e:
+            warmup_time = time.time() - warmup_start
+            logger.error(
+                "azure tts warmup failed",
+                extra={
+                    "duration": f"{warmup_time:.3f}s",
+                    "error": str(e),
+                    "error_type": type(e).__name__
+                },
+                exc_info=True
+            )
+            raise
 
     async def _run(self, output_emitter: tts.AudioEmitter) -> None:
         request_id = utils.shortuuid()
@@ -452,25 +545,44 @@ class SynthesizeStream(tts.SynthesizeStream):
             self._text_ch.close()
 
         async def _run_synthesis() -> None:
-            """Run synthesis task with retry on 499 errors."""
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    await self._synthesize_segment(output_emitter)
-                    break  # Success, exit retry loop
-                except (APIStatusError, APIConnectionError) as e:
-                    # Check if it's a 499 error (client closed connection)
-                    error_str = str(e)
-                    if "499" in error_str or "closed by client" in error_str.lower():
-                        if attempt < max_retries - 1:
-                            logger.warning(
-                                f"azure tts 499 error, recreating synthesizer and retrying (attempt {attempt + 1}/{max_retries})"
-                            )
-                            # Recreate synthesizer
-                            self._recreate_synthesizer()
-                            await asyncio.sleep(1.0)  # Wait before retry
-                            continue
-                    raise  # Re-raise if not retryable or out of retries
+            """Run synthesis task - let base framework handle retries."""
+            # Check if synthesizer needs recreation due to previous errors
+            # This can happen when the base framework retries with a new AudioEmitter
+            if self._tts._synthesizer is None:
+                logger.debug("[SYNTHESIS] synthesizer is None, recreating")
+                self._tts._synthesizer = self._create_synthesizer()
+                if not self._tts._warmup_done:
+                    self._warmup_synthesizer()
+            
+            try:
+                await self._synthesize_segment(output_emitter)
+            except (APIStatusError, APIConnectionError) as e:
+                # Check if this is a user interruption (not a real error)
+                error_str = str(e).lower()
+                is_user_interruption = (
+                    "499" in error_str and "closed by client" in error_str and
+                    ("cancelledbyuser" in error_str.replace(" ", "").replace("_", "") or
+                     "usp state: turnstarted" in error_str)
+                )
+                
+                if is_user_interruption:
+                    # User interruption is normal - don't treat as error, don't retry
+                    logger.info(f"[SYNTHESIS] synthesis cancelled due to user interruption (normal behavior), not retrying")
+                    return  # Exit normally without raising
+                
+                # On real connection errors, mark synthesizer for recreation on next attempt
+                # The base framework will retry with a new AudioEmitter
+                if ("timeout" in error_str or "usp error" in error_str or
+                    ("499" in error_str and "closed by client" not in error_str)):
+                    logger.warning(f"[SYNTHESIS] connection error, will recreate synthesizer on next retry: {e}")
+                    # Clean up synthesizer so it gets recreated on next attempt
+                    try:
+                        if self._tts._synthesizer:
+                            del self._tts._synthesizer
+                            self._tts._synthesizer = None
+                    except:
+                        pass
+                raise  # Let base framework handle retry
 
         tasks = [
             asyncio.create_task(_forward_input()),
@@ -491,8 +603,20 @@ class SynthesizeStream(tts.SynthesizeStream):
         self, output_emitter: tts.AudioEmitter
     ) -> None:
         """Synthesize using Azure SDK with streaming text and audio."""
+        import time
+        
+        # Check connection health before synthesis
+        # if not self._check_connection_health():
+        #     logger.info("recreating stale azure tts connection")
+        #     self._recreate_synthesizer()
+        
         segment_id = utils.shortuuid()
+        logger.debug(f"[SEGMENT] starting new segment: {segment_id}")
         output_emitter.start_segment(segment_id=segment_id)
+        logger.debug(f"[SEGMENT] segment {segment_id} started successfully")
+        
+        # Track synthesis start time
+        # synthesis_start = time.time()
 
         # Use asyncio Queue to bridge sync callbacks to async
         audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
@@ -504,49 +628,78 @@ class SynthesizeStream(tts.SynthesizeStream):
         loop = asyncio.get_event_loop()
 
         def _run_sdk_synthesis() -> None:
-            """Run Azure SDK synthesis in sync mode with streaming callbacks."""            
+            """Run Azure SDK synthesis in sync mode with streaming callbacks."""
+            logger.info(f"[SDK_THREAD] Starting SDK synthesis thread for segment {segment_id}")
+            
             def synthesizing_callback(evt):
                 """Called when audio chunks are available during synthesis."""
-                import time
+                logger.info(f"[SDK_CALLBACK] synthesizing_callback triggered, cancelled={cancelled[0]}")
                 if cancelled[0]:
+                    logger.debug("[SDK_CALLBACK] discarding audio due to cancellation")
                     return  # Discard audio if cancelled
                 if evt.result.audio_data:
                     # Raw PCM format - no headers to strip
                     audio_chunk = evt.result.audio_data
-
-                    # print(f"  [SDK Callback {time.time():.3f}] Received audio chunk: {len(audio_chunk)} bytes")
+                    logger.info(f"[SDK_CALLBACK] received audio chunk: {len(audio_chunk)} bytes")
                     # Send audio to async queue (thread-safe)
                     asyncio.run_coroutine_threadsafe(audio_queue.put(audio_chunk), loop)
+                else:
+                    logger.warning("[SDK_CALLBACK] synthesizing event has no audio_data")
 
             def completed_callback(evt):
                 """Called when synthesis completes successfully."""
+                logger.info(f"[SDK_CALLBACK] completed_callback triggered, reason={evt.result.reason}")
                 # Signal completion with None
                 asyncio.run_coroutine_threadsafe(audio_queue.put(None), loop)
 
             def canceled_callback(evt):
                 """Called when synthesis is canceled or fails."""
                 cancellation = evt.result.cancellation_details
-                error = APIStatusError(
-                    f"Azure TTS synthesis canceled: {cancellation.reason}. "
-                    f"Error: {cancellation.error_details}"
+                error_details = cancellation.error_details if cancellation.error_details else ""
+                
+                # Check if this is a user interruption (client closed request)
+                is_user_interruption = (
+                    "499" in error_details or
+                    "closed by client" in error_details.lower() or
+                    cancelled[0]  # We set this flag when user interrupts
                 )
-                synthesis_error.append(error)
-                # Signal error completion
-                asyncio.run_coroutine_threadsafe(audio_queue.put(None), loop)
+                
+                if is_user_interruption:
+                    logger.info(f"[SDK_CALLBACK] synthesis cancelled due to user interruption (this is normal)")
+                    logger.debug(f"[SDK_CALLBACK] cancellation details: {cancellation.reason}, {error_details}")
+                    # Don't treat user interruption as an error - just signal completion
+                    asyncio.run_coroutine_threadsafe(audio_queue.put(None), loop)
+                else:
+                    # This is a real error
+                    logger.error(f"[SDK_CALLBACK] synthesis canceled with error")
+                    logger.error(f"[SDK_CALLBACK] cancellation reason: {cancellation.reason}, error: {error_details}")
+                    error = APIStatusError(
+                        f"Azure TTS synthesis canceled: {cancellation.reason}. "
+                        f"Error: {error_details}"
+                    )
+                    synthesis_error.append(error)
+                    # Signal error completion
+                    asyncio.run_coroutine_threadsafe(audio_queue.put(None), loop)
 
             # Connect event handlers
+            logger.info("[SDK_THREAD] connecting event handlers to synthesizer")
             self._tts._synthesizer.synthesizing.connect(synthesizing_callback)
             self._tts._synthesizer.synthesis_completed.connect(completed_callback)
             self._tts._synthesizer.synthesis_canceled.connect(canceled_callback)
+            logger.info("[SDK_THREAD] event handlers connected successfully")
 
             # Create streaming request
+            logger.info("[SDK_THREAD] creating speech synthesis request with TextStream input")
             tts_request = speechsdk.SpeechSynthesisRequest(
                 input_type=speechsdk.SpeechSynthesisRequestInputType.TextStream
             )
+            logger.info("[SDK_THREAD] speech synthesis request created")
 
             try:
                 # Start synthesis (returns result future)
+                logger.info("[SDK_THREAD] calling speak_async to start synthesis")
                 result_future = self._tts._synthesizer.speak_async(tts_request)
+                logger.info("[SDK_THREAD] speak_async called, synthesis task started, waiting for text input")
 
                 # Stream text pieces as they arrive from the queue
                 chunk_count = [0]
@@ -565,38 +718,62 @@ class SynthesizeStream(tts.SynthesizeStream):
                     logger.info("streaming tts chunk", extra={"chunk": chunk_count[0], "text": text_piece})
 
                 # Close input stream to signal completion
+                logger.info("[SDK_THREAD] closing input stream to signal end of text")
                 tts_request.input_stream.close()
+                logger.info("[SDK_THREAD] input stream closed")
                 
                 # Wait for synthesis to complete
                 # This blocks until the SDK finishes and callbacks fire
+                logger.info("[SDK_THREAD] waiting for synthesis to complete (blocking call)")
                 result = result_future.get()
+                logger.info(f"[SDK_THREAD] synthesis completed with reason: {result.reason}")
                 
                 # Ensure completion signal is sent
                 if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
+                    logger.info("[SDK_THREAD] synthesis completed successfully, sending completion signal")
+                    asyncio.run_coroutine_threadsafe(audio_queue.put(None), loop)
+                else:
+                    logger.warning(f"[SDK_THREAD] unexpected result reason: {result.reason}")
+                    # Still send completion signal to avoid hanging
                     asyncio.run_coroutine_threadsafe(audio_queue.put(None), loop)
                 
             except Exception as e:
+                logger.error(f"[SDK_THREAD] exception in SDK synthesis: {e}", exc_info=True)
                 synthesis_error.append(e)
                 asyncio.run_coroutine_threadsafe(audio_queue.put(None), loop)
 
         async def _stream_text_input() -> None:
             """Stream text chunks to the SDK as they arrive."""
+            logger.info(f"[TEXT_INPUT] starting text input streaming for segment {segment_id}")
+            chunk_count = 0
+            total_text_length = 0
             async for text_chunk in self._text_ch:
                 if text_chunk is None:
                     # End of segment
+                    logger.info(f"[TEXT_INPUT] received end-of-segment signal after {chunk_count} chunks, total {total_text_length} chars")
                     break
+                chunk_count += 1
+                total_text_length += len(text_chunk)
+                logger.info(f"[TEXT_INPUT] received chunk {chunk_count} ({len(text_chunk)} chars): '{text_chunk[:100]}...'")
                 self._mark_started()
                 # Send to sync thread via sync queue
+                logger.debug(f"[TEXT_INPUT] putting chunk {chunk_count} into text_queue")
                 text_queue.put(text_chunk)
+                logger.debug(f"[TEXT_INPUT] chunk {chunk_count} queued successfully")
             # Signal end of text
+            logger.info(f"[TEXT_INPUT] signaling end of text to SDK thread (total chunks: {chunk_count})")
             text_queue.put(None)
+            logger.info(f"[TEXT_INPUT] text input streaming completed")
   
         async def _receive_audio() -> None:
             """Receive audio chunks as they arrive."""
+            logger.info(f"[AUDIO_RX] starting audio reception for segment {segment_id}")
+            audio_chunk_count = 0
+            total_audio_bytes = 0
             try:
                 while True:
                     if cancelled[0]:
-                        logger.debug("audio reception cancelled, discarding remaining chunks")
+                        logger.info("[AUDIO_RX] audio reception cancelled, discarding remaining chunks")
                         # Drain remaining audio
                         while not audio_queue.empty():
                             try:
@@ -605,41 +782,67 @@ class SynthesizeStream(tts.SynthesizeStream):
                                 break
                         break
 
+                    logger.debug(f"[AUDIO_RX] waiting for audio chunk from queue (received {audio_chunk_count} so far)")
                     audio_chunk = await audio_queue.get()
+                    logger.debug(f"[AUDIO_RX] got item from queue: {type(audio_chunk)}, is_none={audio_chunk is None}")
 
                     # None signals completion
                     if audio_chunk is None:
+                        logger.info(f"[AUDIO_RX] received completion signal, total chunks: {audio_chunk_count}, total bytes: {total_audio_bytes}")
+                        if audio_chunk_count == 0:
+                            logger.error(f"[AUDIO_RX] ⚠️ NO AUDIO CHUNKS RECEIVED! This is the root cause of 'no audio frames were pushed'")
                         break
 
                     # Only push audio if not cancelled
                     if not cancelled[0]:
+                        audio_chunk_count += 1
+                        total_audio_bytes += len(audio_chunk)
+                        logger.info(f"[AUDIO_RX] received audio chunk {audio_chunk_count}: {len(audio_chunk)} bytes, pushing to output")
                         output_emitter.push(audio_chunk)
+                        logger.debug(f"[AUDIO_RX] chunk {audio_chunk_count} pushed successfully")
+                    else:
+                        logger.debug(f"[AUDIO_RX] discarding chunk due to cancellation")
             except asyncio.CancelledError:
+                logger.info("[AUDIO_RX] audio reception task cancelled")
                 cancelled[0] = True
+                raise
+            except Exception as e:
+                logger.error(f"[AUDIO_RX] error in audio reception: {e}", exc_info=True)
                 raise
 
         try:
+            logger.info(f"[SEGMENT] starting synthesis orchestration for segment {segment_id}")
+            
             # Start SDK synthesis in thread pool
+            logger.info("[SEGMENT] launching SDK synthesis in thread pool")
             synthesis_task = loop.run_in_executor(None, _run_sdk_synthesis)
+            logger.info("[SEGMENT] SDK synthesis task launched")
 
             # Run text streaming and audio receiving concurrently
+            logger.info("[SEGMENT] starting text input and audio reception tasks")
             await asyncio.gather(
                 _stream_text_input(),
                 _receive_audio()
             )
+            logger.info("[SEGMENT] text input and audio reception tasks completed")
 
             # Check for errors
             if synthesis_error:
+                logger.error(f"[SEGMENT] synthesis error detected: {synthesis_error[0]}")
                 raise synthesis_error[0]
 
             # Wait for synthesis thread to complete
+            logger.info("[SEGMENT] waiting for SDK synthesis thread to complete")
             await synthesis_task
+            logger.info("[SEGMENT] SDK synthesis thread completed")
 
+            logger.info(f"[SEGMENT] ending segment {segment_id}")
             output_emitter.end_segment()
+            logger.info(f"[SEGMENT] segment {segment_id} ended successfully")
 
         except asyncio.CancelledError:
             # Clean up on interruption
-            logger.info("synthesis interrupted, stopping synthesizer")
+            logger.info(f"[SEGMENT] synthesis interrupted for segment {segment_id}, stopping synthesizer")
             cancelled[0] = True
 
             # Stop the Azure synthesizer to terminate ongoing synthesis
@@ -652,11 +855,11 @@ class SynthesizeStream(tts.SynthesizeStream):
                         loop.run_in_executor(None, stop_future.get),
                         timeout=1.0
                     )
-                    logger.debug("stopped azure synthesizer")
+                    logger.debug("[SEGMENT] stopped azure synthesizer")
             except asyncio.TimeoutError:
-                logger.warning("timeout stopping synthesizer")
+                logger.warning("[SEGMENT] timeout stopping synthesizer")
             except Exception as e:
-                logger.warning(f"error stopping synthesizer: {e}")
+                logger.warning(f"[SEGMENT] error stopping synthesizer: {e}")
 
             # Signal SDK thread to stop
             text_queue.put(None)
@@ -664,9 +867,11 @@ class SynthesizeStream(tts.SynthesizeStream):
             output_emitter.flush()
             # End segment on cancellation
             try:
+                logger.debug(f"[SEGMENT] attempting to end segment {segment_id} after cancellation")
                 output_emitter.end_segment()
-            except:
-                pass  # Segment might already be ended
+                logger.debug(f"[SEGMENT] segment {segment_id} ended after cancellation")
+            except Exception as e:
+                logger.warning(f"[SEGMENT] failed to end segment {segment_id} after cancellation: {e}")
             # Drain queues
             while not text_queue.empty():
                 try:
@@ -680,20 +885,54 @@ class SynthesizeStream(tts.SynthesizeStream):
                     break
             raise
         except Exception as e:
-            # End segment on error
-            try:
-                output_emitter.end_segment()
-            except:
-                pass  # Segment might already be ended
-            # Clean up queues on error
-            while not text_queue.empty():
+            # Check if this is a user interruption error
+            error_str = str(e).lower()
+            is_user_interruption = (
+                "499" in error_str or
+                "closed by client" in error_str or
+                "cancelledbyuser" in error_str.replace(" ", "").replace("_", "")
+            )
+            
+            if is_user_interruption:
+                # User interruption is normal, not an error
+                logger.info(f"[SEGMENT] segment {segment_id} cancelled due to user interruption (normal behavior)")
                 try:
-                    text_queue.get_nowait()
-                except:
-                    break
-            while not audio_queue.empty():
+                    logger.debug(f"[SEGMENT] ending segment {segment_id} after user interruption")
+                    output_emitter.end_segment()
+                    logger.debug(f"[SEGMENT] segment {segment_id} ended after user interruption")
+                except Exception as end_error:
+                    logger.debug(f"[SEGMENT] failed to end segment {segment_id} after interruption: {end_error}")
+                # Clean up queues
+                while not text_queue.empty():
+                    try:
+                        text_queue.get_nowait()
+                    except:
+                        break
+                while not audio_queue.empty():
+                    try:
+                        await asyncio.wait_for(audio_queue.get(), timeout=0.01)
+                    except:
+                        break
+                # Don't raise error for user interruption - just return normally
+                return
+            else:
+                # This is a real error
+                logger.error(f"[SEGMENT] error in segment {segment_id}: {e}", exc_info=True)
                 try:
-                    await asyncio.wait_for(audio_queue.get(), timeout=0.01)
-                except:
-                    break
-            raise APIConnectionError(f"Azure SDK synthesis failed: {e}") from e
+                    logger.debug(f"[SEGMENT] attempting to end segment {segment_id} after error")
+                    output_emitter.end_segment()
+                    logger.debug(f"[SEGMENT] segment {segment_id} ended after error")
+                except Exception as end_error:
+                    logger.error(f"[SEGMENT] failed to end segment {segment_id} after error: {end_error}")
+                # Clean up queues on error
+                while not text_queue.empty():
+                    try:
+                        text_queue.get_nowait()
+                    except:
+                        break
+                while not audio_queue.empty():
+                    try:
+                        await asyncio.wait_for(audio_queue.get(), timeout=0.01)
+                    except:
+                        break
+                raise APIConnectionError(f"Azure SDK synthesis failed: {e}") from e
