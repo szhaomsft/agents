@@ -210,8 +210,6 @@ class TTS(tts.TTS):
         # Shared synthesizer and warmup state across all streams
         self._synthesizer: speechsdk.SpeechSynthesizer | None = None
         self._warmup_done = False
-        self._last_synthesis_time: float = 0  # Track last successful synthesis
-        self._connection_timeout = 300.0  # 5 minutes idle timeout (conservative)
 
     @property
     def model(self) -> str:
@@ -382,34 +380,7 @@ class SynthesizeStream(tts.SynthesizeStream):
         # The warmup is only needed once per TTS instance, not per synthesizer
         # Resetting it here causes segment state issues when warmup is called during retry
         logger.debug("[RECREATE] synthesizer recreated, skipping warmup to avoid segment state issues")
-    # def _check_connection_health(self) -> bool:
-    #     """Check if the connection might be stale and needs recreation."""
-    #     import time
-        
-    #     if not self._tts._synthesizer:
-    #         logger.debug("no synthesizer exists, needs creation")
-    #         return False
-            
-    #     if self._tts._last_synthesis_time == 0:
-    #         # Never used, should be fine
-    #         return True
-            
-    #     time_since_last_use = time.time() - self._tts._last_synthesis_time
-        
-    #     if time_since_last_use > self._tts._connection_timeout:
-    #         logger.warning(
-    #             "azure tts connection may be stale, will recreate",
-    #             extra={
-    #                 "idle_time": f"{time_since_last_use:.1f}s",
-    #                 "timeout_threshold": f"{self._tts._connection_timeout:.1f}s"
-    #             }
-    #         )
-    #         return False
-            
-    #     return True
-
-
-
+ 
     def _create_synthesizer(self) -> speechsdk.SpeechSynthesizer:
         """Create and configure the Azure Speech synthesizer."""
         logger.info("[CREATE_SYNTH] creating new Azure Speech synthesizer")
@@ -744,36 +715,30 @@ class SynthesizeStream(tts.SynthesizeStream):
 
         async def _stream_text_input() -> None:
             """Stream text chunks to the SDK as they arrive."""
-            logger.info(f"[TEXT_INPUT] starting text input streaming for segment {segment_id}")
+
             chunk_count = 0
             total_text_length = 0
             async for text_chunk in self._text_ch:
                 if text_chunk is None:
                     # End of segment
-                    logger.info(f"[TEXT_INPUT] received end-of-segment signal after {chunk_count} chunks, total {total_text_length} chars")
                     break
                 chunk_count += 1
                 total_text_length += len(text_chunk)
-                logger.info(f"[TEXT_INPUT] received chunk {chunk_count} ({len(text_chunk)} chars): '{text_chunk[:100]}...'")
                 self._mark_started()
                 # Send to sync thread via sync queue
                 logger.debug(f"[TEXT_INPUT] putting chunk {chunk_count} into text_queue")
                 text_queue.put(text_chunk)
                 logger.debug(f"[TEXT_INPUT] chunk {chunk_count} queued successfully")
             # Signal end of text
-            logger.info(f"[TEXT_INPUT] signaling end of text to SDK thread (total chunks: {chunk_count})")
             text_queue.put(None)
-            logger.info(f"[TEXT_INPUT] text input streaming completed")
   
         async def _receive_audio() -> None:
             """Receive audio chunks as they arrive."""
-            logger.info(f"[AUDIO_RX] starting audio reception for segment {segment_id}")
             audio_chunk_count = 0
             total_audio_bytes = 0
             try:
                 while True:
                     if cancelled[0]:
-                        logger.info("[AUDIO_RX] audio reception cancelled, discarding remaining chunks")
                         # Drain remaining audio
                         while not audio_queue.empty():
                             try:
@@ -788,7 +753,6 @@ class SynthesizeStream(tts.SynthesizeStream):
 
                     # None signals completion
                     if audio_chunk is None:
-                        logger.info(f"[AUDIO_RX] received completion signal, total chunks: {audio_chunk_count}, total bytes: {total_audio_bytes}")
                         if audio_chunk_count == 0:
                             logger.error(f"[AUDIO_RX] ⚠️ NO AUDIO CHUNKS RECEIVED! This is the root cause of 'no audio frames were pushed'")
                         break
@@ -797,42 +761,27 @@ class SynthesizeStream(tts.SynthesizeStream):
                     if not cancelled[0]:
                         audio_chunk_count += 1
                         total_audio_bytes += len(audio_chunk)
-                        logger.info(f"[AUDIO_RX] received audio chunk {audio_chunk_count}: {len(audio_chunk)} bytes, pushing to output")
                         output_emitter.push(audio_chunk)
-                        logger.debug(f"[AUDIO_RX] chunk {audio_chunk_count} pushed successfully")
-                    else:
-                        logger.debug(f"[AUDIO_RX] discarding chunk due to cancellation")
             except asyncio.CancelledError:
-                logger.info("[AUDIO_RX] audio reception task cancelled")
                 cancelled[0] = True
                 raise
             except Exception as e:
-                logger.error(f"[AUDIO_RX] error in audio reception: {e}", exc_info=True)
                 raise
 
         try:
-            logger.info(f"[SEGMENT] starting synthesis orchestration for segment {segment_id}")
-            
             # Start SDK synthesis in thread pool
-            logger.info("[SEGMENT] launching SDK synthesis in thread pool")
             synthesis_task = loop.run_in_executor(None, _run_sdk_synthesis)
-            logger.info("[SEGMENT] SDK synthesis task launched")
-
             # Run text streaming and audio receiving concurrently
-            logger.info("[SEGMENT] starting text input and audio reception tasks")
             await asyncio.gather(
                 _stream_text_input(),
                 _receive_audio()
             )
-            logger.info("[SEGMENT] text input and audio reception tasks completed")
-
             # Check for errors
             if synthesis_error:
                 logger.error(f"[SEGMENT] synthesis error detected: {synthesis_error[0]}")
                 raise synthesis_error[0]
 
             # Wait for synthesis thread to complete
-            logger.info("[SEGMENT] waiting for SDK synthesis thread to complete")
             await synthesis_task
             logger.info("[SEGMENT] SDK synthesis thread completed")
 
