@@ -509,10 +509,13 @@ class SynthesizeStream(tts.SynthesizeStream):
             """Forward text chunks directly to synthesis."""
             async for input in self._input_ch:
                 if isinstance(input, str):
+                    logger.debug("[FORWARD_INPUT] enqueue text chunk", extra={"len": len(input)})
                     self._text_ch.send_nowait(input)
                 elif isinstance(input, self._FlushSentinel):
+                    logger.debug("[FORWARD_INPUT] flush sentinel received -> segment boundary")
                     # Flush marks segment boundary
                     self._text_ch.send_nowait(None)
+            logger.debug("[FORWARD_INPUT] closing text channel after input stream end")
             self._text_ch.close()
 
         async def _run_synthesis() -> None:
@@ -619,7 +622,7 @@ class SynthesizeStream(tts.SynthesizeStream):
 
             def completed_callback(evt):
                 """Called when synthesis completes successfully."""
-                logger.info(f"[SDK_CALLBACK] completed_callback triggered, reason={evt.result.reason}")
+                # logger.info(f"[SDK_CALLBACK] completed_callback triggered, reason={evt.result.reason}")
                 # Signal completion with None
                 asyncio.run_coroutine_threadsafe(audio_queue.put(None), loop)
 
@@ -642,7 +645,7 @@ class SynthesizeStream(tts.SynthesizeStream):
                     asyncio.run_coroutine_threadsafe(audio_queue.put(None), loop)
                 else:
                     # This is a real error
-                    logger.error(f"[SDK_CALLBACK] synthesis canceled with error")
+                    # logger.error(f"[SDK_CALLBACK] synthesis canceled with error")
                     logger.error(f"[SDK_CALLBACK] cancellation reason: {cancellation.reason}, error: {error_details}")
                     error = APIStatusError(
                         f"Azure TTS synthesis canceled: {cancellation.reason}. "
@@ -720,16 +723,18 @@ class SynthesizeStream(tts.SynthesizeStream):
             total_text_length = 0
             async for text_chunk in self._text_ch:
                 if text_chunk is None:
+                    logger.debug("[TEXT_INPUT] received segment terminator (None)")
                     # End of segment
                     break
                 chunk_count += 1
                 total_text_length += len(text_chunk)
                 self._mark_started()
                 # Send to sync thread via sync queue
-                logger.debug(f"[TEXT_INPUT] putting chunk {chunk_count} into text_queue")
+                logger.debug(f"[TEXT_INPUT] putting chunk {chunk_count} into text_queue", extra={"len": len(text_chunk)})
                 text_queue.put(text_chunk)
                 logger.debug(f"[TEXT_INPUT] chunk {chunk_count} queued successfully")
             # Signal end of text
+            logger.debug("[TEXT_INPUT] sending None to text_queue to close segment")
             text_queue.put(None)
   
         async def _receive_audio() -> None:
@@ -743,7 +748,7 @@ class SynthesizeStream(tts.SynthesizeStream):
                         while not audio_queue.empty():
                             try:
                                 await asyncio.wait_for(audio_queue.get(), timeout=0.01)
-                            except:
+                            except Exception:
                                 break
                         break
 
@@ -751,16 +756,54 @@ class SynthesizeStream(tts.SynthesizeStream):
                     audio_chunk = await audio_queue.get()
                     logger.debug(f"[AUDIO_RX] got item from queue: {type(audio_chunk)}, is_none={audio_chunk is None}")
 
-                    # None signals completion
+                    # None signals completion - but callbacks may still be firing
                     if audio_chunk is None:
+                        # Wait briefly to collect any trailing chunks from callbacks
+                        logger.debug("[AUDIO_RX] completion sentinel received, waiting 100ms for trailing chunks")
+                        trailing_chunks = 0
+                        try:
+                            while True:
+                                next_chunk = await asyncio.wait_for(audio_queue.get(), timeout=0.1)
+                                if next_chunk is None:
+                                    # Second sentinel, truly done
+                                    break
+                                if not cancelled[0]:
+                                    trailing_chunks += 1
+                                    audio_chunk_count += 1
+                                    total_audio_bytes += len(next_chunk)
+                                    logger.debug(
+                                        "[AUDIO_RX] pushing trailing audio chunk",
+                                        extra={"chunk_idx": audio_chunk_count, "len": len(next_chunk)},
+                                    )
+                                    output_emitter.push(next_chunk)
+                        except asyncio.TimeoutError:
+                            # No more chunks arriving
+                            pass
+                        
+                        if trailing_chunks > 0:
+                            logger.info(
+                                "[AUDIO_RX] collected trailing chunks after completion sentinel",
+                                extra={"trailing": trailing_chunks},
+                            )
+                        
                         if audio_chunk_count == 0:
-                            logger.error(f"[AUDIO_RX] ⚠️ NO AUDIO CHUNKS RECEIVED! This is the root cause of 'no audio frames were pushed'")
+                            logger.error(
+                                "[AUDIO_RX] ⚠️ NO AUDIO CHUNKS RECEIVED! This is the root cause of 'no audio frames were pushed'"
+                            )
+                        logger.info(
+                            "[AUDIO_RX] audio stream completed",
+                            extra={"chunks": audio_chunk_count, "bytes": total_audio_bytes},
+                        )
                         break
 
                     # Only push audio if not cancelled
                     if not cancelled[0]:
                         audio_chunk_count += 1
                         total_audio_bytes += len(audio_chunk)
+                        logger.debug(
+                            "[AUDIO_RX] pushing audio chunk",
+                            extra={"chunk_idx": audio_chunk_count, "len": len(audio_chunk)},
+                        )
                         output_emitter.push(audio_chunk)
             except asyncio.CancelledError:
                 cancelled[0] = True
