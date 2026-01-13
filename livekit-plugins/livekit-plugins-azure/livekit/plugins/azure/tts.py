@@ -232,6 +232,9 @@ class TTS(tts.TTS):
             mark_refreshed_on_get=True,
         )
 
+        # Store target pool size for maintaining minimum synthesizers
+        self._num_prewarm = num_prewarm
+
         # Prewarm synthesizers if requested
         if num_prewarm > 0:
             self.prewarm(count=num_prewarm)
@@ -544,21 +547,25 @@ class SynthesizeStream(tts.SynthesizeStream):
                     self._text_ch.send_nowait(None)
             self._text_ch.close()
 
-        # Get synthesizer from pool - automatic lifecycle management
+        # Log pool status before acquiring connection
+        pool_total = len(self._tts._pool._connections)
+        pool_available = len(self._tts._pool._available)
+        logger.info(
+            "acquiring synthesizer from pool",
+            extra={
+                "pool_total": pool_total,
+                "pool_available": pool_available,
+                "pool_in_use": pool_total - pool_available,
+            }
+        )
+
+        # Use context manager for automatic pool lifecycle management
+        # On success: synthesizer returned to pool
+        # On error/interruption: synthesizer removed from pool (disposed and discarded)
+        synthesis_failed = False
+        synthesis_interrupted = False
         synthesizer = None
         try:
-            # Log pool status before acquiring connection
-            pool_total = len(self._tts._pool._connections)
-            pool_available = len(self._tts._pool._available)
-            logger.info(
-                "acquiring synthesizer from pool",
-                extra={
-                    "pool_total": pool_total,
-                    "pool_available": pool_available,
-                    "pool_in_use": pool_total - pool_available,
-                }
-            )
-
             synthesizer = await self._tts._pool.get(timeout=self._conn_options.timeout)
 
             # Log pool status after acquiring
@@ -580,17 +587,18 @@ class SynthesizeStream(tts.SynthesizeStream):
             try:
                 await asyncio.gather(*tasks)
             except asyncio.CancelledError:
-                # Task was cancelled (e.g., user interrupted)
-                # Manually return synthesizer to pool before re-raising
-                logger.debug("synthesis tasks cancelled, returning synthesizer to pool")
-                self._tts._pool.put(synthesizer)
-                synthesizer = None  # Mark as returned
+                # User interrupted - remove synthesizer to be safe (may be in bad state)
+                logger.debug("synthesis cancelled, removing synthesizer from pool")
+                synthesis_interrupted = True
                 raise  # Re-raise so base TTS class knows synthesis was cancelled
             except asyncio.TimeoutError:
+                synthesis_failed = True
                 raise APITimeoutError() from None
             except (APIStatusError, APIConnectionError):
-                raise  # Don't wrap these errors again
+                synthesis_failed = True
+                raise  # Synthesizer will be removed in finally block
             except Exception as e:
+                synthesis_failed = True
                 raise APIConnectionError(str(e)) from e
             finally:
                 await utils.aio.gracefully_cancel(*tasks)
@@ -598,23 +606,84 @@ class SynthesizeStream(tts.SynthesizeStream):
             # Success - return synthesizer to pool
             self._tts._pool.put(synthesizer)
             synthesizer = None  # Mark as returned
-
-            # Log pool status after returning synthesizer
+        except BaseException:
+            # If synthesizer wasn't returned yet, remove it from pool
+            # (either failed or interrupted - both need fresh synthesizer)
+            if synthesizer is not None:
+                self._tts._pool.remove(synthesizer)
+                synthesizer = None  # Mark as removed
+            raise
+        finally:
+            # Log pool status after returning/removing synthesizer
             pool_total_final = len(self._tts._pool._connections)
             pool_available_final = len(self._tts._pool._available)
+
+            if synthesis_failed:
+                log_msg = "removed failed synthesizer from pool"
+            elif synthesis_interrupted:
+                log_msg = "removed interrupted synthesizer from pool"
+            else:
+                log_msg = "returning synthesizer to pool"
+
             logger.info(
-                "returning synthesizer to pool",
+                log_msg,
                 extra={
                     "pool_total": pool_total_final,
                     "pool_available": pool_available_final,
                     "pool_in_use": pool_total_final - pool_available_final,
+                    "synthesis_failed": synthesis_failed,
+                    "synthesis_interrupted": synthesis_interrupted,
                 }
             )
-        except BaseException:
-            # If synthesizer wasn't returned yet, remove it from pool
-            if synthesizer is not None:
-                self._tts._pool.remove(synthesizer)
-            raise
+
+            # Proactively create a replacement synthesizer when one is removed
+            # This maintains pool readiness without waiting for the next request
+            # Always maintain at least num_prewarm synthesizers in the pool
+            target_pool_size = max(1, self._tts._num_prewarm)
+            should_create_replacement = (synthesis_failed or synthesis_interrupted) and pool_total_final < target_pool_size
+            logger.debug(
+                f"replacement check: synthesis_failed={synthesis_failed}, synthesis_interrupted={synthesis_interrupted}, "
+                f"pool_total_final={pool_total_final}, target_pool_size={target_pool_size}, should_create={should_create_replacement}"
+            )
+            if should_create_replacement:
+                logger.info(
+                    "creating replacement synthesizer to maintain pool size",
+                    extra={
+                        "target_pool_size": target_pool_size,
+                        "current_pool_size": pool_total_final,
+                        "reason": "failed" if synthesis_failed else "interrupted",
+                    }
+                )
+                asyncio.create_task(self._create_replacement_synthesizer())
+
+    async def _create_replacement_synthesizer(self) -> None:
+        """Create a replacement synthesizer in the background to maintain pool size.
+
+        This is called when a synthesizer fails and is removed from the pool.
+        It proactively creates a new synthesizer so the pool remains ready for future requests.
+        """
+        try:
+            async with self._tts._pool._connect_lock:
+                # Create and warm up a new synthesizer
+                synthesizer = await self._tts._pool._connect(timeout=30.0)
+                # Add it to the pool
+                self._tts._pool.put(synthesizer)
+                logger.info(
+                    "replacement synthesizer created and added to pool",
+                    extra={
+                        "pool_total": len(self._tts._pool._connections),
+                        "pool_available": len(self._tts._pool._available),
+                    }
+                )
+        except Exception as e:
+            logger.warning(
+                f"failed to create replacement synthesizer: {e}",
+                extra={
+                    "pool_total": len(self._tts._pool._connections),
+                    "pool_available": len(self._tts._pool._available),
+                }
+            )
+
 
     async def _synthesize_segment(
         self, output_emitter: tts.AudioEmitter, synthesizer: speechsdk.SpeechSynthesizer
@@ -628,12 +697,14 @@ class SynthesizeStream(tts.SynthesizeStream):
         synthesis_error: list[Exception] = []
         text_queue: queue.Queue[str | None] = queue.Queue()  # Sync queue for thread-safe access
         cancelled = [False]  # Flag to signal cancellation to SDK thread
+        first_audio_received = [False]  # Track first audio chunk
+        synthesis_start_time = [0.0]  # Track when synthesis starts
 
         # Get the event loop before entering the thread
         loop = asyncio.get_event_loop()
 
         def _run_sdk_synthesis() -> None:
-            """Run Azure SDK synthesis in sync mode with streaming callbacks."""            
+            """Run Azure SDK synthesis in sync mode with streaming callbacks."""
             def synthesizing_callback(evt):
                 """Called when audio chunks are available during synthesis."""
                 import time
@@ -642,6 +713,18 @@ class SynthesizeStream(tts.SynthesizeStream):
                 if evt.result.audio_data:
                     # Raw PCM format - no headers to strip
                     audio_chunk = evt.result.audio_data
+
+                    # Log first audio chunk received
+                    if not first_audio_received[0]:
+                        first_audio_received[0] = True
+                        ttfb = time.time() - synthesis_start_time[0]
+                        logger.info(
+                            "first audio chunk received from Azure",
+                            extra={
+                                "time_to_first_byte": f"{ttfb:.3f}s",
+                                "chunk_size": len(audio_chunk),
+                            }
+                        )
 
                     # print(f"  [SDK Callback {time.time():.3f}] Received audio chunk: {len(audio_chunk)} bytes")
                     # Send audio to async queue (thread-safe)
@@ -655,13 +738,24 @@ class SynthesizeStream(tts.SynthesizeStream):
             def canceled_callback(evt):
                 """Called when synthesis is canceled or fails."""
                 cancellation = evt.result.cancellation_details
-                error = APIStatusError(
-                    f"Azure TTS synthesis canceled: {cancellation.reason}. "
-                    f"Error: {cancellation.error_details}"
-                )
-                synthesis_error.append(error)
-                # Signal error completion
-                asyncio.run_coroutine_threadsafe(audio_queue.put(None), loop)
+
+                # Check if this was a user cancellation (synthesizer still healthy)
+                # vs a server/connection error (synthesizer broken)
+                if cancellation.reason == speechsdk.CancellationReason.CancelledByUser:
+                    # User interrupted - synthesizer is still healthy
+                    logger.debug(f"synthesis cancelled by user: {cancellation.error_details}")
+                    # Don't add to synthesis_error - this is not a failure
+                    # Signal completion normally
+                    asyncio.run_coroutine_threadsafe(audio_queue.put(None), loop)
+                else:
+                    # Real error (connection error, server error, etc.)
+                    error = APIStatusError(
+                        f"Azure TTS synthesis canceled: {cancellation.reason}. "
+                        f"Error: {cancellation.error_details}"
+                    )
+                    synthesis_error.append(error)
+                    # Signal error completion
+                    asyncio.run_coroutine_threadsafe(audio_queue.put(None), loop)
 
             # Connect event handlers
             synthesizer.synthesizing.connect(synthesizing_callback)
@@ -689,6 +783,13 @@ class SynthesizeStream(tts.SynthesizeStream):
                     if cancelled[0]:
                         break
                     chunk_count[0] += 1
+
+                    # Start timer when first text chunk is sent
+                    if chunk_count[0] == 1:
+                        import time
+                        synthesis_start_time[0] = time.time()
+                        logger.debug("sending first text chunk to Azure TTS")
+
                     tts_request.input_stream.write(text_piece)
                     # Log each chunk as it's streamed
                     logger.info("streaming tts chunk", extra={"chunk": chunk_count[0], "text": text_piece})
