@@ -92,7 +92,7 @@ async def my_agent(ctx: JobContext):
             speech_key=os.environ["AZURE_SPEECH_KEY"],
             speech_region=os.environ["AZURE_SPEECH_REGION"],
             voice="en-IN-Meera:DragonHDLatestNeural",
-            num_prewarm=5  # Prewarm 5 synthesizers for faster response
+            num_prewarm=6  # Prewarm 5 synthesizers for faster response
         ),
 
         #  tts=inference.TTS(
