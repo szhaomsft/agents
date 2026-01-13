@@ -158,7 +158,25 @@ class TTS(tts.TTS):
         deployment_id: str | None = None,
         speech_auth_token: str | None = None,
         http_session: aiohttp.ClientSession | None = None,
+        num_prewarm: int = 0,
     ) -> None:
+        """
+        Create a new instance of Azure TTS.
+
+        Args:
+            voice: Voice name (e.g., "en-US-JennyNeural")
+            language: Language code (e.g., "en-US")
+            sample_rate: Audio sample rate in Hz
+            prosody: Prosody configuration for rate, volume, pitch
+            style: Style configuration for expression
+            speech_key: Azure Speech API key (or set AZURE_SPEECH_KEY env var)
+            speech_region: Azure region (or set AZURE_SPEECH_REGION env var)
+            speech_endpoint: Custom endpoint URL
+            deployment_id: Custom deployment ID
+            speech_auth_token: Authentication token
+            http_session: Optional aiohttp session
+            num_prewarm: Number of synthesizers to prewarm on initialization (default: 0)
+        """
         super().__init__(
             capabilities=tts.TTSCapabilities(streaming=True),
             sample_rate=sample_rate,
@@ -207,9 +225,16 @@ class TTS(tts.TTS):
             auth_token=speech_auth_token,
         )
         self._streams = weakref.WeakSet[SynthesizeStream]()
-        # Shared synthesizer and warmup state across all streams
-        self._synthesizer: speechsdk.SpeechSynthesizer | None = None
-        self._warmup_done = False
+        self._pool = utils.ConnectionPool[speechsdk.SpeechSynthesizer](
+            connect_cb=self._create_and_warmup_synthesizer,
+            close_cb=self._close_synthesizer,
+            max_session_duration=300,  # 5 minutes
+            mark_refreshed_on_get=True,
+        )
+
+        # Prewarm synthesizers if requested
+        if num_prewarm > 0:
+            self.prewarm(count=num_prewarm)
 
     @property
     def model(self) -> str:
@@ -243,6 +268,153 @@ class TTS(tts.TTS):
             self._session = utils.http_context.http_session()
         return self._session
 
+    async def _create_and_warmup_synthesizer(self, timeout: float) -> speechsdk.SpeechSynthesizer:
+        """Create and warm up a new Azure Speech synthesizer.
+
+        This runs in a thread pool since Azure SDK is synchronous.
+        Each synthesizer gets its own warmup - no shared state.
+
+        Args:
+            timeout: Connection timeout in seconds
+
+        Returns:
+            Warmed-up synthesizer ready for use
+        """
+        def _sync_create_and_warmup() -> speechsdk.SpeechSynthesizer:
+            import time
+
+            # Build WebSocket v2 endpoint
+            if self._opts.speech_endpoint:
+                endpoint = self._opts.speech_endpoint.replace(
+                    "/cognitiveservices/v1", "/cognitiveservices/websocket/v2"
+                )
+            else:
+                endpoint = f"wss://{self._opts.region}.tts.speech.microsoft.com/cognitiveservices/websocket/v2"
+
+            # Create speech config
+            speech_config = speechsdk.SpeechConfig(
+                endpoint=endpoint,
+                subscription=self._opts.subscription_key or "",
+            )
+
+            # Set deployment ID if provided
+            if self._opts.deployment_id:
+                speech_config.endpoint_id = self._opts.deployment_id
+
+            # Set voice and output format
+            speech_config.speech_synthesis_voice_name = self._opts.voice
+
+            # Use SDK format if available
+            if self._opts.sample_rate in SDK_OUTPUT_FORMATS:
+                speech_config.set_speech_synthesis_output_format(
+                    SDK_OUTPUT_FORMATS[self._opts.sample_rate]
+                )
+            else:
+                # Default to 24kHz raw format
+                speech_config.set_speech_synthesis_output_format(
+                    speechsdk.SpeechSynthesisOutputFormat.Raw24Khz16BitMonoPcm
+                )
+
+            # Create synthesizer (no audio config - we'll use events)
+            synthesizer = speechsdk.SpeechSynthesizer(
+                speech_config=speech_config, audio_config=None
+            )
+
+            # Warm up synthesizer
+            logger.info("warming up azure tts synthesizer")
+            warmup_start = time.time()
+            warmup_request = speechsdk.SpeechSynthesisRequest(
+                input_type=speechsdk.SpeechSynthesisRequestInputType.TextStream
+            )
+            warmup_task = synthesizer.speak_async(warmup_request)
+            warmup_request.input_stream.write("Warm up.")
+            warmup_request.input_stream.close()
+            warmup_result = warmup_task.get()
+
+            if warmup_result.reason != speechsdk.ResultReason.SynthesizingAudioCompleted:
+                raise APIConnectionError(
+                    f"Azure TTS warmup failed: {warmup_result.cancellation_details.reason}"
+                )
+
+            warmup_time = time.time() - warmup_start
+            logger.info("azure tts warmup completed", extra={"duration": f"{warmup_time:.3f}s"})
+
+            return synthesizer
+
+        # Run in thread pool (Azure SDK is synchronous)
+        loop = asyncio.get_event_loop()
+        try:
+            return await asyncio.wait_for(
+                loop.run_in_executor(None, _sync_create_and_warmup),
+                timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            raise APITimeoutError(f"Azure TTS synthesizer creation timed out") from None
+        except Exception as e:
+            raise APIConnectionError(f"Failed to create synthesizer: {e}") from e
+
+    async def _close_synthesizer(self, synthesizer: speechsdk.SpeechSynthesizer) -> None:
+        """Close and clean up an Azure Speech synthesizer.
+
+        Args:
+            synthesizer: The synthesizer to close
+        """
+        def _sync_close(synth: speechsdk.SpeechSynthesizer) -> None:
+            try:
+                # Stop any ongoing synthesis
+                stop_future = synth.stop_speaking_async()
+                # Wait briefly for stop (with timeout to avoid hanging)
+                try:
+                    stop_future.get()  # This is synchronous
+                except:
+                    pass  # Ignore errors during cleanup
+            except Exception as e:
+                logger.warning(f"error closing azure synthesizer: {e}")
+
+        # Run cleanup in thread pool
+        loop = asyncio.get_event_loop()
+        try:
+            await asyncio.wait_for(
+                loop.run_in_executor(None, lambda: _sync_close(synthesizer)),
+                timeout=2.0  # Short timeout for cleanup
+            )
+        except asyncio.TimeoutError:
+            logger.warning("timeout closing azure synthesizer")
+        except Exception as e:
+            logger.warning(f"error closing azure synthesizer: {e}")
+
+    def prewarm(self, count: int = 1) -> None:
+        """Prewarm the connection pool with multiple synthesizers.
+
+        Args:
+            count: Number of synthesizers to create and warm up. Defaults to 1.
+        """
+        import asyncio
+
+        async def _prewarm_multiple() -> None:
+            """Create and warm up multiple synthesizers sequentially."""
+            for i in range(count):
+                try:
+                    logger.info(f"prewarming synthesizer {i + 1}/{count}")
+                    # Use the pool's connect method which handles locking
+                    async with self._pool._connect_lock:
+                        if len(self._pool._connections) < i + 1:  # Only create if needed
+                            # Use longer timeout for prewarming (Azure warmup takes 2-3s)
+                            conn = await self._pool._connect(timeout=30.0)
+                            self._pool.put(conn)
+                            logger.info(
+                                f"synthesizer {i + 1}/{count} prewarmed",
+                                extra={
+                                    "pool_total": len(self._pool._connections),
+                                    "pool_available": len(self._pool._available),
+                                }
+                            )
+                except Exception as e:
+                    logger.warning(f"failed to prewarm synthesizer {i + 1}/{count}: {e}")
+
+        # Run prewarm in background
+        asyncio.create_task(_prewarm_multiple())
+
     def synthesize(
         self,
         text: str,
@@ -262,6 +434,7 @@ class TTS(tts.TTS):
         for stream in list(self._streams):
             await stream.aclose()
         self._streams.clear()
+        await self._pool.aclose()
 
 
 class ChunkedStream(tts.ChunkedStream):
@@ -350,86 +523,6 @@ class SynthesizeStream(tts.SynthesizeStream):
         self._tts: TTS = tts
         self._opts = replace(tts._opts)
         self._text_ch = utils.aio.Chan[str]()
-        # Use shared synthesizer from TTS instance
-        if self._tts._synthesizer is None:
-            self._tts._synthesizer = self._create_synthesizer()
-            # Warm up only once
-            self._warmup_synthesizer()
-
-    def _recreate_synthesizer(self) -> None:
-        """Recreate the synthesizer after connection issues."""
-        logger.info("recreating azure tts synthesizer after connection error")
-        try:
-            if self._tts._synthesizer:
-                # Clean up old synthesizer
-                del self._tts._synthesizer
-        except:
-            pass
-        self._tts._synthesizer = self._create_synthesizer()
-        self._tts._warmup_done = False
-        self._warmup_synthesizer()
-
-
-    def _create_synthesizer(self) -> speechsdk.SpeechSynthesizer:
-        """Create and configure the Azure Speech synthesizer."""
-        # Build WebSocket v2 endpoint
-        if self._opts.speech_endpoint:
-            endpoint = self._opts.speech_endpoint.replace(
-                "/cognitiveservices/v1", "/cognitiveservices/websocket/v2"
-            )
-        else:
-            endpoint = f"wss://{self._opts.region}.tts.speech.microsoft.com/cognitiveservices/websocket/v2"
-
-        # Create speech config
-        speech_config = speechsdk.SpeechConfig(
-            endpoint=endpoint,
-            subscription=self._opts.subscription_key or "",
-        )
-
-        # Set deployment ID if provided
-        if self._opts.deployment_id:
-            speech_config.endpoint_id = self._opts.deployment_id
-
-        # Set voice and output format
-        speech_config.speech_synthesis_voice_name = self._opts.voice
-        
-        # Use SDK format if available
-        if self._opts.sample_rate in SDK_OUTPUT_FORMATS:
-            speech_config.set_speech_synthesis_output_format(
-                SDK_OUTPUT_FORMATS[self._opts.sample_rate]
-            )
-        else:
-            # Default to 24kHz raw format
-            speech_config.set_speech_synthesis_output_format(
-                speechsdk.SpeechSynthesisOutputFormat.Raw24Khz16BitMonoPcm
-            )
-
-        # Create synthesizer (no audio config - we'll use events)
-        return speechsdk.SpeechSynthesizer(
-            speech_config=speech_config, audio_config=None
-        )
-
-    def _warmup_synthesizer(self) -> None:
-        """Warm up the synthesizer by synthesizing a short text."""
-        if self._tts._warmup_done:
-            return
-
-        import time
-
-        # Warm-up: synthesize a short text first to establish connection
-        logger.info("warming up azure tts synthesizer")
-        warmup_start = time.time()
-        warmup_request = speechsdk.SpeechSynthesisRequest(
-            input_type=speechsdk.SpeechSynthesisRequestInputType.TextStream
-        )
-        warmup_task = self._tts._synthesizer.speak_async(warmup_request)
-        warmup_request.input_stream.write("Warm up.")
-        warmup_request.input_stream.close()
-        warmup_result = warmup_task.get()
-        warmup_time = time.time() - warmup_start
-        logger.info("azure tts warmup completed", extra={"duration": f"{warmup_time:.3f}s"})
-
-        self._tts._warmup_done = True
 
     async def _run(self, output_emitter: tts.AudioEmitter) -> None:
         request_id = utils.shortuuid()
@@ -451,44 +544,80 @@ class SynthesizeStream(tts.SynthesizeStream):
                     self._text_ch.send_nowait(None)
             self._text_ch.close()
 
-        async def _run_synthesis() -> None:
-            """Run synthesis task with retry on 499 errors."""
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    await self._synthesize_segment(output_emitter)
-                    break  # Success, exit retry loop
-                except (APIStatusError, APIConnectionError) as e:
-                    # Check if it's a 499 error (client closed connection)
-                    error_str = str(e)
-                    if "499" in error_str or "closed by client" in error_str.lower():
-                        if attempt < max_retries - 1:
-                            logger.warning(
-                                f"azure tts 499 error, recreating synthesizer and retrying (attempt {attempt + 1}/{max_retries})"
-                            )
-                            # Recreate synthesizer
-                            self._recreate_synthesizer()
-                            await asyncio.sleep(1.0)  # Wait before retry
-                            continue
-                    raise  # Re-raise if not retryable or out of retries
-
-        tasks = [
-            asyncio.create_task(_forward_input()),
-            asyncio.create_task(_run_synthesis()),
-        ]
+        # Get synthesizer from pool - automatic lifecycle management
+        synthesizer = None
         try:
-            await asyncio.gather(*tasks)
-        except asyncio.TimeoutError:
-            raise APITimeoutError() from None
-        except (APIStatusError, APIConnectionError):
-            raise  # Don't wrap these errors again
-        except Exception as e:
-            raise APIConnectionError(str(e)) from e
-        finally:
-            await utils.aio.gracefully_cancel(*tasks)
+            # Log pool status before acquiring connection
+            pool_total = len(self._tts._pool._connections)
+            pool_available = len(self._tts._pool._available)
+            logger.info(
+                "acquiring synthesizer from pool",
+                extra={
+                    "pool_total": pool_total,
+                    "pool_available": pool_available,
+                    "pool_in_use": pool_total - pool_available,
+                }
+            )
+
+            synthesizer = await self._tts._pool.get(timeout=self._conn_options.timeout)
+
+            # Log pool status after acquiring
+            pool_total_after = len(self._tts._pool._connections)
+            pool_available_after = len(self._tts._pool._available)
+            logger.info(
+                "synthesizer acquired from pool",
+                extra={
+                    "pool_total": pool_total_after,
+                    "pool_available": pool_available_after,
+                    "pool_in_use": pool_total_after - pool_available_after,
+                }
+            )
+
+            tasks = [
+                asyncio.create_task(_forward_input()),
+                asyncio.create_task(self._synthesize_segment(output_emitter, synthesizer)),
+            ]
+            try:
+                await asyncio.gather(*tasks)
+            except asyncio.CancelledError:
+                # Task was cancelled (e.g., user interrupted)
+                # Manually return synthesizer to pool before re-raising
+                logger.debug("synthesis tasks cancelled, returning synthesizer to pool")
+                self._tts._pool.put(synthesizer)
+                synthesizer = None  # Mark as returned
+                raise  # Re-raise so base TTS class knows synthesis was cancelled
+            except asyncio.TimeoutError:
+                raise APITimeoutError() from None
+            except (APIStatusError, APIConnectionError):
+                raise  # Don't wrap these errors again
+            except Exception as e:
+                raise APIConnectionError(str(e)) from e
+            finally:
+                await utils.aio.gracefully_cancel(*tasks)
+
+            # Success - return synthesizer to pool
+            self._tts._pool.put(synthesizer)
+            synthesizer = None  # Mark as returned
+
+            # Log pool status after returning synthesizer
+            pool_total_final = len(self._tts._pool._connections)
+            pool_available_final = len(self._tts._pool._available)
+            logger.info(
+                "returning synthesizer to pool",
+                extra={
+                    "pool_total": pool_total_final,
+                    "pool_available": pool_available_final,
+                    "pool_in_use": pool_total_final - pool_available_final,
+                }
+            )
+        except BaseException:
+            # If synthesizer wasn't returned yet, remove it from pool
+            if synthesizer is not None:
+                self._tts._pool.remove(synthesizer)
+            raise
 
     async def _synthesize_segment(
-        self, output_emitter: tts.AudioEmitter
+        self, output_emitter: tts.AudioEmitter, synthesizer: speechsdk.SpeechSynthesizer
     ) -> None:
         """Synthesize using Azure SDK with streaming text and audio."""
         segment_id = utils.shortuuid()
@@ -535,9 +664,9 @@ class SynthesizeStream(tts.SynthesizeStream):
                 asyncio.run_coroutine_threadsafe(audio_queue.put(None), loop)
 
             # Connect event handlers
-            self._tts._synthesizer.synthesizing.connect(synthesizing_callback)
-            self._tts._synthesizer.synthesis_completed.connect(completed_callback)
-            self._tts._synthesizer.synthesis_canceled.connect(canceled_callback)
+            synthesizer.synthesizing.connect(synthesizing_callback)
+            synthesizer.synthesis_completed.connect(completed_callback)
+            synthesizer.synthesis_canceled.connect(canceled_callback)
 
             # Create streaming request
             tts_request = speechsdk.SpeechSynthesisRequest(
@@ -546,7 +675,7 @@ class SynthesizeStream(tts.SynthesizeStream):
 
             try:
                 # Start synthesis (returns result future)
-                result_future = self._tts._synthesizer.speak_async(tts_request)
+                result_future = synthesizer.speak_async(tts_request)
 
                 # Stream text pieces as they arrive from the queue
                 chunk_count = [0]
@@ -645,8 +774,8 @@ class SynthesizeStream(tts.SynthesizeStream):
             # Stop the Azure synthesizer to terminate ongoing synthesis
             # This only stops the current operation, synthesizer can be reused
             try:
-                if self._tts._synthesizer:
-                    stop_future = self._tts._synthesizer.stop_speaking_async()
+                if synthesizer:
+                    stop_future = synthesizer.stop_speaking_async()
                     # Wait for stop to complete (with timeout to avoid hanging)
                     await asyncio.wait_for(
                         loop.run_in_executor(None, stop_future.get),
@@ -678,7 +807,9 @@ class SynthesizeStream(tts.SynthesizeStream):
                     await asyncio.wait_for(audio_queue.get(), timeout=0.01)
                 except:
                     break
-            raise
+            # Don't re-raise - synthesizer was cleanly stopped and can be reused
+            logger.debug("synthesizer stopped cleanly, will be returned to pool")
+            return  # Return instead of raise to allow pool to keep synthesizer
         except Exception as e:
             # End segment on error
             try:
