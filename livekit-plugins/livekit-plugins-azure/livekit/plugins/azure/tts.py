@@ -357,7 +357,10 @@ class SynthesizeStream(tts.SynthesizeStream):
         super().__init__(tts=tts, conn_options=conn_options)
         self._tts: TTS = tts
         self._opts = replace(tts._opts)
-        self._text_ch = utils.aio.Chan[str]()
+        self._text_ch: utils.aio.Chan[str] | None = None
+        # Buffer to store text for retry attempts
+        self._buffered_text: list[str | None] = []  # None represents flush sentinel
+        self._input_fully_consumed = False
         # Use shared synthesizer from TTS instance
         if self._tts._synthesizer is None:
             self._tts._synthesizer = self._create_synthesizer()
@@ -492,14 +495,34 @@ class SynthesizeStream(tts.SynthesizeStream):
             stream=True,
         )
 
+        # Create a new text channel for each attempt (needed for retry)
+        self._text_ch = utils.aio.Chan[str]()
+
         async def _forward_input() -> None:
-            """Forward text chunks directly to synthesis."""
+            """Forward text chunks directly to synthesis, buffering for potential retry."""
+            # If input was already consumed in a previous attempt, replay from buffer
+            if self._input_fully_consumed:
+                logger.info(f"[TEXT_INPUT] replaying {len(self._buffered_text)} buffered items for retry")
+                for item in self._buffered_text:
+                    if item is None:
+                        # None represents flush sentinel
+                        self._text_ch.send_nowait(None)
+                    else:
+                        self._text_ch.send_nowait(item)
+                self._text_ch.close()
+                return
+            
+            # First attempt: consume from input channel and buffer for potential retry
             async for input in self._input_ch:
                 if isinstance(input, str):
+                    self._buffered_text.append(input)
                     self._text_ch.send_nowait(input)
                 elif isinstance(input, self._FlushSentinel):
-                    # Flush marks segment boundary
+                    # Flush marks segment boundary (store as None in buffer)
+                    self._buffered_text.append(None)
                     self._text_ch.send_nowait(None)
+            
+            self._input_fully_consumed = True
             self._text_ch.close()
 
         async def _run_synthesis() -> None:
@@ -512,7 +535,8 @@ class SynthesizeStream(tts.SynthesizeStream):
                     self._warmup_synthesizer()
             
             try:
-                await self._synthesize_segment(output_emitter)
+                # Pass the buffered text for replay on retry
+                await self._synthesize_segment(output_emitter, self._buffered_text if self._input_fully_consumed else None)
             except (APIStatusError, APIConnectionError) as e:
                 # Check if this is a user interruption (not a real error)
                 error_str = str(e).lower()
@@ -557,9 +581,15 @@ class SynthesizeStream(tts.SynthesizeStream):
             await utils.aio.gracefully_cancel(*tasks)
 
     async def _synthesize_segment(
-        self, output_emitter: tts.AudioEmitter
+        self, output_emitter: tts.AudioEmitter, buffered_text: list[str | None] | None = None
     ) -> None:
-        """Synthesize using Azure SDK with streaming text and audio."""
+        """Synthesize using Azure SDK with streaming text and audio.
+        
+        Args:
+            output_emitter: The audio emitter to push audio to.
+            buffered_text: If provided, replay this buffered text instead of reading from channel.
+                          This is used on retry attempts when the input channel was already consumed.
+        """
         import time
         
         # Check connection health before synthesis
@@ -708,16 +738,33 @@ class SynthesizeStream(tts.SynthesizeStream):
             logger.info("[TEXT_INPUT] starting to stream text input")
             chunk_count = 0
             total_text_length = 0
-            async for text_chunk in self._text_ch:
-                if text_chunk is None:
-                    # End of segment
-                    logger.info("[TEXT_INPUT] received None (flush sentinel), ending text stream")
-                    break
-                chunk_count += 1
-                total_text_length += len(text_chunk)
-                self._mark_started()
-                # Send to sync thread via sync queue
-                text_queue.put(text_chunk)
+            
+            # If we have buffered text (retry case), use it directly instead of channel
+            if buffered_text is not None:
+                logger.info(f"[TEXT_INPUT] replaying {len(buffered_text)} buffered items for retry")
+                for text_chunk in buffered_text:
+                    if text_chunk is None:
+                        # End of segment (flush sentinel)
+                        logger.info("[TEXT_INPUT] received None (flush sentinel from buffer), ending text stream")
+                        break
+                    chunk_count += 1
+                    total_text_length += len(text_chunk)
+                    self._mark_started()
+                    # Send to sync thread via sync queue
+                    text_queue.put(text_chunk)
+            else:
+                # Normal case: read from channel
+                async for text_chunk in self._text_ch:
+                    if text_chunk is None:
+                        # End of segment
+                        logger.info("[TEXT_INPUT] received None (flush sentinel), ending text stream")
+                        break
+                    chunk_count += 1
+                    total_text_length += len(text_chunk)
+                    self._mark_started()
+                    # Send to sync thread via sync queue
+                    text_queue.put(text_chunk)
+            
             # Signal end of text
             logger.info(f"[TEXT_INPUT] text streaming complete: {chunk_count} chunks, {total_text_length} chars")
             if chunk_count == 0:
@@ -818,7 +865,6 @@ class SynthesizeStream(tts.SynthesizeStream):
             cancelled[0] = True
 
             # Stop the Azure synthesizer to terminate ongoing synthesis
-            # This only stops the current operation, synthesizer can be reused
             try:
                 if self._tts._synthesizer:
                     stop_future = self._tts._synthesizer.stop_speaking_async()
@@ -832,6 +878,18 @@ class SynthesizeStream(tts.SynthesizeStream):
                 logger.warning("[SEGMENT] timeout stopping synthesizer")
             except Exception as e:
                 logger.warning(f"[SEGMENT] error stopping synthesizer: {e}")
+            
+            # IMPORTANT: Invalidate synthesizer after interruption to force recreation
+            # The Azure SDK's internal WebSocket/USP connection becomes stale after
+            # stop_speaking_async(), causing subsequent synthesis requests to timeout
+            # waiting for audio even though text is accepted successfully.
+            try:
+                if self._tts._synthesizer:
+                    logger.info("[SEGMENT] invalidating synthesizer after interruption to prevent stale connection")
+                    del self._tts._synthesizer
+                    self._tts._synthesizer = None
+            except Exception as e:
+                logger.warning(f"[SEGMENT] error invalidating synthesizer: {e}")
 
             # Signal SDK thread to stop
             text_queue.put(None)
