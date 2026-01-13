@@ -1,6 +1,6 @@
 **/.vscode
 **/.DS_Store
-
+**/.claude
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -177,3 +177,4 @@ docs/
 
 # Examples for development
 examples/dev/*
+*.wav

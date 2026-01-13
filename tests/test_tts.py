@@ -52,10 +52,29 @@ TEST_AUDIO_SYNTHESIZE_MULTI_TOKENS = pathlib.Path(
 
 PROXY_LISTEN = "0.0.0.0:443"
 OAI_LISTEN = "0.0.0.0:500"
+AZURE_STT_LISTEN = "0.0.0.0:501"
 
 
 def setup_oai_proxy(toxiproxy: Toxiproxy) -> Proxy:
     return toxiproxy.create("api.openai.com:443", "oai-stt-proxy", listen=OAI_LISTEN, enabled=True)
+
+
+def setup_azure_stt_proxy(toxiproxy: Toxiproxy) -> Proxy:
+    azure_speech_region = os.environ.get("AZURE_SPEECH_REGION", "westus")
+    return toxiproxy.create(
+        f"{azure_speech_region}.stt.speech.microsoft.com:443",
+        "azure-stt-proxy",
+        listen=AZURE_STT_LISTEN,
+        enabled=True,
+    )
+
+
+def setup_stt_proxy(toxiproxy: Toxiproxy) -> None:
+    """Set up STT proxy based on available API keys."""
+    if os.environ.get("OPENAI_API_KEY"):
+        setup_oai_proxy(toxiproxy)
+    elif os.environ.get("AZURE_SPEECH_KEY"):
+        setup_azure_stt_proxy(toxiproxy)
 
 
 async def assert_valid_synthesized_audio(
@@ -103,31 +122,95 @@ async def assert_valid_synthesized_audio(
     assert frame.num_channels == num_channels, "num channels should be the same"
 
     data = frame.to_wav_bytes()
-    form = aiohttp.FormData()
-    form.add_field("file", data, filename="file.wav", content_type="audio/wav")
-    form.add_field("model", "whisper-1")
-    form.add_field("response_format", "verbose_json")
 
-    ssl_ctx = ssl.create_default_context()
-    connector = aiohttp.TCPConnector(ssl=ssl_ctx)
+    # Choose STT backend based on available API keys
+    openai_api_key = os.environ.get("OPENAI_API_KEY")
+    azure_speech_key = os.environ.get("AZURE_SPEECH_KEY")
+    azure_speech_region = os.environ.get("AZURE_SPEECH_REGION", "westus")
 
-    async with aiohttp.ClientSession(
-        connector=connector, timeout=aiohttp.ClientTimeout(total=30)
-    ) as session:
-        async with session.post(
-            "https://toxiproxy:500/v1/audio/transcriptions",
-            data=form,
-            headers={
-                "Host": "api.openai.com",
-                "Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}",
-            },
-            ssl=ssl_ctx,
-            server_hostname="api.openai.com",
-        ) as resp:
-            result = await resp.json()
+    if openai_api_key:
+        # Use OpenAI Whisper API
+        form = aiohttp.FormData()
+        form.add_field("file", data, filename="file.wav", content_type="audio/wav")
+        form.add_field("model", "whisper-1")
+        form.add_field("response_format", "verbose_json")
+
+        ssl_ctx = ssl.create_default_context()
+        connector = aiohttp.TCPConnector(ssl=ssl_ctx)
+
+        async with aiohttp.ClientSession(
+            connector=connector, timeout=aiohttp.ClientTimeout(total=30)
+        ) as session:
+            async with session.post(
+                "https://toxiproxy:500/v1/audio/transcriptions",
+                data=form,
+                headers={
+                    "Host": "api.openai.com",
+                    "Authorization": f"Bearer {openai_api_key}",
+                },
+                ssl=ssl_ctx,
+                server_hostname="api.openai.com",
+            ) as resp:
+                result = await resp.json()
+
+        transcribed_text = result["text"]
+
+    elif azure_speech_key:
+        # Use Azure Speech-to-Text API through toxiproxy
+        azure_stt_host = f"{azure_speech_region}.stt.speech.microsoft.com"
+        azure_stt_url = (
+            "https://toxiproxy:501/"
+            "speech/recognition/conversation/cognitiveservices/v1"
+            "?language=en-US&format=detailed"
+        )
+
+        ssl_ctx = ssl.create_default_context()
+        connector = aiohttp.TCPConnector(ssl=ssl_ctx)
+
+        headers = {
+            "Host": azure_stt_host,
+            "Ocp-Apim-Subscription-Key": azure_speech_key,
+            "Content-Type": "audio/wav",
+            "Accept": "application/json",
+        }
+
+        async with aiohttp.ClientSession(
+            connector=connector, timeout=aiohttp.ClientTimeout(total=30)
+        ) as session:
+            async with session.post(
+                azure_stt_url,
+                data=data,
+                headers=headers,
+                ssl=ssl_ctx,
+                server_hostname=azure_stt_host,
+            ) as resp:
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    raise RuntimeError(
+                        f"Azure STT API error: {resp.status} - {error_text}"
+                    )
+                result = await resp.json()
+
+        # Azure returns recognition results in a different format
+        if result.get("RecognitionStatus") == "Success":
+            # Use the best result from NBest array, or DisplayText
+            if "NBest" in result and len(result["NBest"]) > 0:
+                transcribed_text = result["NBest"][0].get("Display", "")
+            else:
+                transcribed_text = result.get("DisplayText", "")
+        else:
+            raise RuntimeError(
+                f"Azure STT recognition failed: {result.get('RecognitionStatus')}"
+            )
+
+    else:
+        raise RuntimeError(
+            "No STT API key found. Set either OPENAI_API_KEY or AZURE_SPEECH_KEY "
+            "in environment variables."
+        )
 
     # semantic
-    assert wer(result["text"], text) <= WER_THRESHOLD
+    assert wer(transcribed_text, text) <= WER_THRESHOLD
 
     # clipping
     # signal = np.array(frame.data, dtype=np.int16).reshape(-1, frame.num_channels)
@@ -294,7 +377,7 @@ async def _do_synthesis(tts_v: tts.TTS, segment: str, *, conn_options: APIConnec
 @pytest.mark.usefixtures("job_process")
 @pytest.mark.parametrize("tts_factory", SYNTHESIZE_TTS)
 async def test_tts_synthesize(tts_factory, toxiproxy: Toxiproxy, logger: logging.Logger):
-    setup_oai_proxy(toxiproxy)
+    setup_stt_proxy(toxiproxy)
     tts_info: dict = tts_factory()
     tts_v: tts.TTS = tts_info["tts"]
     proxy_upstream = tts_info["proxy-upstream"]
@@ -325,9 +408,14 @@ async def test_tts_synthesize(tts_factory, toxiproxy: Toxiproxy, logger: logging
 @pytest.mark.usefixtures("job_process")
 @pytest.mark.parametrize("tts_factory", SYNTHESIZE_TTS)
 async def test_tts_synthesize_timeout(tts_factory, toxiproxy: Toxiproxy):
-    setup_oai_proxy(toxiproxy)
+    setup_stt_proxy(toxiproxy)
     tts_info: dict = tts_factory()
     tts_v: tts.TTS = tts_info["tts"]
+
+    # Skip Azure - uses WebSocket SDK which doesn't work with toxiproxy timeouts
+    if "azure" in tts_v.label.lower():
+        pytest.skip("Azure TTS uses WebSocket SDK, timeout tests not applicable")
+
     proxy_upstream = tts_info["proxy-upstream"]
     proxy_name = f"{tts_v.label}-proxy"
     p = toxiproxy.create(proxy_upstream, proxy_name, listen=PROXY_LISTEN, enabled=True)
@@ -405,6 +493,19 @@ STREAM_TTS = [
             "proxy-upstream": "api.cartesia.ai:443",
         },
         id="cartesia",
+    ),
+        pytest.param(
+
+        lambda: {
+
+            "tts": azure.TTS(),
+
+            "proxy-upstream": "westus.tts.speech.microsoft.com:443",
+
+        },
+
+        id="azure",
+
     ),
     pytest.param(
         lambda: {
@@ -556,7 +657,7 @@ async def _do_stream(tts_v: tts.TTS, segments: list[str], *, conn_options: APICo
 @pytest.mark.usefixtures("job_process")
 @pytest.mark.parametrize("tts_factory", STREAM_TTS)
 async def test_tts_stream(tts_factory, toxiproxy: Toxiproxy, logger: logging.Logger):
-    setup_oai_proxy(toxiproxy)
+    setup_stt_proxy(toxiproxy)
     tts_info: dict = tts_factory()
     tts_v: tts.TTS = tts_info["tts"]
     proxy_upstream = tts_info["proxy-upstream"]
@@ -620,7 +721,7 @@ async def test_tts_stream(tts_factory, toxiproxy: Toxiproxy, logger: logging.Log
 @pytest.mark.usefixtures("job_process")
 @pytest.mark.parametrize("tts_factory", STREAM_TTS)
 async def test_tts_stream_empty(tts_factory, toxiproxy: Toxiproxy):
-    setup_oai_proxy(toxiproxy)
+    setup_stt_proxy(toxiproxy)
     tts_info: dict = tts_factory()
     tts_v: tts.TTS = tts_info["tts"]
     proxy_upstream = tts_info["proxy-upstream"]
@@ -645,9 +746,14 @@ async def test_tts_stream_empty(tts_factory, toxiproxy: Toxiproxy):
 @pytest.mark.usefixtures("job_process")
 @pytest.mark.parametrize("tts_factory", STREAM_TTS)
 async def test_tts_stream_timeout(tts_factory, toxiproxy: Toxiproxy):
-    setup_oai_proxy(toxiproxy)
+    setup_stt_proxy(toxiproxy)
     tts_info: dict = tts_factory()
     tts_v: tts.TTS = tts_info["tts"]
+
+    # Skip Azure - uses WebSocket SDK which doesn't work with toxiproxy timeouts
+    if "azure" in tts_v.label.lower():
+        pytest.skip("Azure TTS uses WebSocket SDK, timeout tests not applicable")
+
     proxy_upstream = tts_info["proxy-upstream"]
     proxy_name = f"{tts_v.label}-proxy"
     p = toxiproxy.create(proxy_upstream, proxy_name, listen=PROXY_LISTEN, enabled=True)
