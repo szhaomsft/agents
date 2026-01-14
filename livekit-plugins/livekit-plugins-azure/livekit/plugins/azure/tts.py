@@ -720,6 +720,21 @@ class SynthesizeStream(tts.SynthesizeStream):
         """
         try:
             async with self._tts._pool._connect_lock:
+                # Check pool size again before creating - other tasks may have already filled it
+                target_pool_size = max(1, self._tts._num_prewarm)
+                current_pool_size = len(self._tts._pool._connections)
+
+                if current_pool_size >= target_pool_size:
+                    logger.debug(
+                        "skipping replacement synthesizer creation - pool already at target size",
+                        extra={
+                            "pool_total": current_pool_size,
+                            "pool_available": len(self._tts._pool._available),
+                            "target_pool_size": target_pool_size,
+                        }
+                    )
+                    return
+
                 # Create and warm up a new synthesizer
                 synthesizer = await self._tts._pool._connect(timeout=30.0)
                 # Add it to the pool

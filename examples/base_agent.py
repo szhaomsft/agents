@@ -70,7 +70,8 @@ async def my_agent(ctx: JobContext):
         stt=azure.STT(
             speech_key=os.environ["AZURE_SPEECH_KEY"],
             speech_region=os.environ["AZURE_SPEECH_REGION"],
-	),
+            segmentation_silence_timeout_ms=300
+),
 
         # stt=openai.STT.with_azure(
         #     model="gpt-4o-mini-transcribe",
