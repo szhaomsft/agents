@@ -230,7 +230,7 @@ class TTS(tts.TTS):
         self._pool = utils.ConnectionPool[speechsdk.SpeechSynthesizer](
             connect_cb=self._create_and_warmup_synthesizer,
             close_cb=self._close_synthesizer,
-            max_session_duration=300,  # 5 minutes
+            max_session_duration=300,  # 5 minutes (jitter applied per-connection during prewarm)
             mark_refreshed_on_get=True,
         )
 
@@ -411,7 +411,8 @@ class TTS(tts.TTS):
         import asyncio
 
         async def _prewarm_multiple() -> None:
-            """Create and warm up multiple synthesizers sequentially."""
+            """Create and warm up multiple synthesizers sequentially with jittered expiry times."""
+            import random
             for i in range(count):
                 try:
                     logger.info(f"prewarming synthesizer {i + 1}/{count}")
@@ -420,6 +421,13 @@ class TTS(tts.TTS):
                         if len(self._pool._connections) < i + 1:  # Only create if needed
                             # Use longer timeout for prewarming (Azure warmup takes 2-3s)
                             conn = await self._pool._connect(timeout=30.0)
+
+                            # Add random jitter to connection timestamp to stagger expiry times
+                            # This prevents all prewarmed synthesizers from expiring simultaneously
+                            # Jitter range: -60 to 0 seconds (spreads expiries over 1 minute)
+                            jitter = random.uniform(-60, 0)
+                            self._pool._connections[conn] += jitter
+
                             self._pool.put(conn)
                             logger.info(
                                 f"synthesizer {i + 1}/{count} prewarmed",
