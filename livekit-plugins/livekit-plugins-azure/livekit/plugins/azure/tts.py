@@ -373,6 +373,19 @@ class TTS(tts.TTS):
                     stop_future.get()  # This is synchronous
                 except:
                     pass  # Ignore errors during cleanup
+
+                # Disconnect all event handlers to break references
+                try:
+                    synth.synthesizing.disconnect_all()
+                    synth.synthesis_completed.disconnect_all()
+                    synth.synthesis_canceled.disconnect_all()
+                except:
+                    pass
+
+                # Force connection close by deleting the synthesizer
+                # This triggers the Azure SDK's destructor which closes the WebSocket
+                del synth
+
             except Exception as e:
                 logger.warning(f"error closing azure synthesizer: {e}")
 
@@ -383,6 +396,7 @@ class TTS(tts.TTS):
                 loop.run_in_executor(None, lambda: _sync_close(synthesizer)),
                 timeout=2.0  # Short timeout for cleanup
             )
+            logger.debug("synthesizer connection closed")
         except asyncio.TimeoutError:
             logger.warning("timeout closing azure synthesizer")
         except Exception as e:
@@ -630,6 +644,8 @@ class SynthesizeStream(tts.SynthesizeStream):
             # (either failed or interrupted - both need fresh synthesizer)
             if synthesizer is not None:
                 self._tts._pool.remove(synthesizer)
+                # Immediately close the connection instead of waiting for next drain cycle
+                await self._tts._pool._drain_to_close()
                 synthesizer = None  # Mark as removed
             raise
         finally:
