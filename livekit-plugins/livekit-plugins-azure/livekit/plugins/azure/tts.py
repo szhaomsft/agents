@@ -15,6 +15,8 @@ from __future__ import annotations
 import asyncio
 import os
 import queue
+import time
+import wave
 import weakref
 from dataclasses import dataclass, replace
 from typing import Literal
@@ -158,7 +160,7 @@ class TTS(tts.TTS):
         deployment_id: str | None = None,
         speech_auth_token: str | None = None,
         http_session: aiohttp.ClientSession | None = None,
-        num_prewarm: int = 0,
+        num_prewarm: int = 10,
     ) -> None:
         """
         Create a new instance of Azure TTS.
@@ -175,7 +177,7 @@ class TTS(tts.TTS):
             deployment_id: Custom deployment ID
             speech_auth_token: Authentication token
             http_session: Optional aiohttp session
-            num_prewarm: Number of synthesizers to prewarm on initialization (default: 0)
+            num_prewarm: Number of synthesizers to prewarm on initialization (default: 10)
         """
         super().__init__(
             capabilities=tts.TTSCapabilities(streaming=True),
@@ -526,6 +528,10 @@ class SynthesizeStream(tts.SynthesizeStream):
         self._tts: TTS = tts
         self._opts = replace(tts._opts)
         self._text_ch = utils.aio.Chan[str]()
+        # Check environment variable for audio saving
+        self._save_audio = int(os.getenv("AZURE_TTS_SAVE_AUDIO", 0)) > 0
+        self._audio_data: list[bytes] = []
+        self._text_data: list[str] = []  # Store text chunks
 
     async def _run(self, output_emitter: tts.AudioEmitter) -> None:
         request_id = utils.shortuuid()
@@ -733,6 +739,11 @@ class SynthesizeStream(tts.SynthesizeStream):
         cancelled = [False]  # Flag to signal cancellation to SDK thread
         first_audio_received = [False]  # Track first audio chunk
         synthesis_start_time = [0.0]  # Track when synthesis starts
+        audio_chunks_from_sdk = [0]  # Track total chunks received from SDK
+        audio_chunks_queued = [0]  # Track chunks successfully queued
+        import threading
+        audio_lock = threading.Lock()  # Lock to synchronize audio callbacks
+        synthesis_complete_event = threading.Event()  # Signal when synthesis truly complete
 
         # Get the event loop before entering the thread
         loop = asyncio.get_event_loop()
@@ -745,29 +756,41 @@ class SynthesizeStream(tts.SynthesizeStream):
                 if cancelled[0]:
                     return  # Discard audio if cancelled
                 if evt.result.audio_data:
-                    # Raw PCM format - no headers to strip
-                    audio_chunk = evt.result.audio_data
+                    with audio_lock:  # Ensure completion callback waits for us
+                        # Raw PCM format - no headers to strip
+                        audio_chunk = evt.result.audio_data
 
-                    # Log first audio chunk received
-                    if not first_audio_received[0]:
-                        first_audio_received[0] = True
-                        ttfb = time.time() - synthesis_start_time[0]
-                        logger.info(
-                            "first audio chunk received from Azure",
-                            extra={
-                                "time_to_first_byte": f"{ttfb:.3f}s",
-                                "chunk_size": len(audio_chunk),
-                            }
-                        )
+                        # Track chunks received from SDK
+                        audio_chunks_from_sdk[0] += 1
 
-                    # print(f"  [SDK Callback {time.time():.3f}] Received audio chunk: {len(audio_chunk)} bytes")
-                    # Send audio to async queue (thread-safe)
-                    asyncio.run_coroutine_threadsafe(audio_queue.put(audio_chunk), loop)
+                        # Save audio data if enabled
+                        if self._save_audio:
+                            self._audio_data.append(bytes(audio_chunk))
+
+                        # Log first audio chunk received
+                        if not first_audio_received[0]:
+                            first_audio_received[0] = True
+                            ttfb = time.time() - synthesis_start_time[0]
+                            logger.info(
+                                "first audio chunk received from Azure",
+                                extra={
+                                    "time_to_first_byte": f"{ttfb:.3f}s",
+                                    "chunk_size": len(audio_chunk),
+                                }
+                            )
+
+                        # Send audio to async queue (thread-safe)
+                        future = asyncio.run_coroutine_threadsafe(audio_queue.put(audio_chunk), loop)
+                        # Wait for it to complete to ensure ordering
+                        future.result()
+                        audio_chunks_queued[0] += 1
 
             def completed_callback(evt):
                 """Called when synthesis completes successfully."""
-                # Signal completion with None
-                asyncio.run_coroutine_threadsafe(audio_queue.put(None), loop)
+                # Signal that synthesis is complete from SDK perspective
+                synthesis_complete_event.set()
+                with audio_lock:
+                    logger.debug(f"Synthesis completed callback, {audio_chunks_queued[0]} chunks queued so far")
 
             def canceled_callback(evt):
                 """Called when synthesis is canceled or fails."""
@@ -830,18 +853,36 @@ class SynthesizeStream(tts.SynthesizeStream):
 
                 # Close input stream to signal completion
                 tts_request.input_stream.close()
-                
+
                 # Wait for synthesis to complete
                 # This blocks until the SDK finishes and callbacks fire
                 result = result_future.get()
-                
-                # Ensure completion signal is sent
-                if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
-                    asyncio.run_coroutine_threadsafe(audio_queue.put(None), loop)
-                
+
+                # Wait for synthesis_complete_event from completed_callback
+                synthesis_complete_event.wait(timeout=5.0)
+
+                # Now wait for all audio chunks to be queued by acquiring the lock
+                # This ensures any in-flight synthesizing_callback calls complete
+                with audio_lock:
+                    logger.debug(f"Synthesis result received, {audio_chunks_queued[0]} total chunks queued")
+                    if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
+                        asyncio.run_coroutine_threadsafe(audio_queue.put(None), loop)
+
+                # Disconnect event handlers to prevent them from firing on next use
+                synthesizer.synthesizing.disconnect_all()
+                synthesizer.synthesis_completed.disconnect_all()
+                synthesizer.synthesis_canceled.disconnect_all()
+
             except Exception as e:
                 synthesis_error.append(e)
                 asyncio.run_coroutine_threadsafe(audio_queue.put(None), loop)
+                # Disconnect handlers even on error
+                try:
+                    synthesizer.synthesizing.disconnect_all()
+                    synthesizer.synthesis_completed.disconnect_all()
+                    synthesizer.synthesis_canceled.disconnect_all()
+                except:
+                    pass
 
         async def _stream_text_input() -> None:
             """Stream text chunks to the SDK as they arrive."""
@@ -850,6 +891,9 @@ class SynthesizeStream(tts.SynthesizeStream):
                     # End of segment
                     break
                 self._mark_started()
+                # Save text if audio saving is enabled
+                if self._save_audio:
+                    self._text_data.append(text_chunk)
                 # Send to sync thread via sync queue
                 text_queue.put(text_chunk)
             # Signal end of text
@@ -857,6 +901,7 @@ class SynthesizeStream(tts.SynthesizeStream):
   
         async def _receive_audio() -> None:
             """Receive audio chunks as they arrive."""
+            chunk_count = 0
             try:
                 while True:
                     if cancelled[0]:
@@ -873,10 +918,12 @@ class SynthesizeStream(tts.SynthesizeStream):
 
                     # None signals completion
                     if audio_chunk is None:
+                        logger.debug(f"Received completion signal, pushed {chunk_count} audio chunks to playback (SDK sent {audio_chunks_from_sdk[0]}, queued {audio_chunks_queued[0]})")
                         break
 
                     # Only push audio if not cancelled
                     if not cancelled[0]:
+                        chunk_count += 1
                         output_emitter.push(audio_chunk)
             except asyncio.CancelledError:
                 cancelled[0] = True
@@ -900,6 +947,34 @@ class SynthesizeStream(tts.SynthesizeStream):
             await synthesis_task
 
             output_emitter.end_segment()
+
+            # Save audio to file if enabled
+            if self._save_audio and len(self._audio_data) > 0:
+                try:
+                    os.makedirs("audio_debug", exist_ok=True)
+                    timestamp = int(time.time() * 1000)
+                    filename = f"audio_debug/response_{segment_id}_{timestamp}.wav"
+                    text_filename = f"audio_debug/response_{segment_id}_{timestamp}.txt"
+
+                    # Save audio
+                    with wave.open(filename, 'wb') as wav_file:
+                        wav_file.setnchannels(1)  # Mono
+                        wav_file.setsampwidth(2)  # 2 bytes for PCM16
+                        wav_file.setframerate(self._opts.sample_rate)
+                        wav_file.writeframes(b''.join(self._audio_data))
+
+                    # Save text
+                    with open(text_filename, 'w', encoding='utf-8') as text_file:
+                        text_file.write(''.join(self._text_data))
+
+                    total_audio_bytes = sum(len(chunk) for chunk in self._audio_data)
+                    logger.info(f"Saved audio response to {filename} ({len(self._audio_data)} chunks, {total_audio_bytes} bytes)")
+                    logger.info(f"Saved text to {text_filename} ({''.join(self._text_data)[:50]}...)")
+                    # Clear data for next synthesis
+                    self._audio_data.clear()
+                    self._text_data.clear()
+                except Exception as e:
+                    logger.error(f"Failed to save audio file: {e}")
 
         except asyncio.CancelledError:
             # Clean up on interruption
