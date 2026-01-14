@@ -571,6 +571,19 @@ class SynthesizeStream(tts.SynthesizeStream):
             # Log pool status after acquiring
             pool_total_after = len(self._tts._pool._connections)
             pool_available_after = len(self._tts._pool._available)
+
+            # Check if connections were expired during acquisition
+            expired_count = pool_total - pool_total_after
+            if expired_count > 0:
+                logger.info(
+                    "expired synthesizers removed during acquisition",
+                    extra={
+                        "expired_count": expired_count,
+                        "pool_total_before": pool_total,
+                        "pool_total_after": pool_total_after,
+                    }
+                )
+
             logger.info(
                 "synthesizer acquired from pool",
                 extra={
@@ -636,25 +649,46 @@ class SynthesizeStream(tts.SynthesizeStream):
                 }
             )
 
-            # Proactively create a replacement synthesizer when one is removed
-            # This maintains pool readiness without waiting for the next request
-            # Always maintain at least num_prewarm synthesizers in the pool
+            # Proactively create replacement synthesizers when needed
+            # Only create replacements when:
+            # 1. Pool is below target size, OR
+            # 2. All synthesizers are busy (none available)
             target_pool_size = max(1, self._tts._num_prewarm)
-            should_create_replacement = (synthesis_failed or synthesis_interrupted) and pool_total_final < target_pool_size
+
+            # Calculate how many we need to reach target size
+            replacements_needed = target_pool_size - pool_total_final
+
+            # Check conditions
+            pool_below_target = pool_total_final < target_pool_size
+            all_busy = pool_available_final == 0
+
             logger.debug(
                 f"replacement check: synthesis_failed={synthesis_failed}, synthesis_interrupted={synthesis_interrupted}, "
-                f"pool_total_final={pool_total_final}, target_pool_size={target_pool_size}, should_create={should_create_replacement}"
+                f"pool_total_final={pool_total_final}, pool_available_final={pool_available_final}, "
+                f"target_pool_size={target_pool_size}, replacements_needed={replacements_needed}, "
+                f"pool_below_target={pool_below_target}, all_busy={all_busy}"
             )
-            if should_create_replacement:
+
+            if replacements_needed > 0 and (pool_below_target or all_busy):
+                reason = "below_target" if pool_below_target else "all_busy"
+                if synthesis_failed:
+                    reason = "failed"
+                elif synthesis_interrupted:
+                    reason = "interrupted"
+
                 logger.info(
-                    "creating replacement synthesizer to maintain pool size",
+                    "creating replacement synthesizers to maintain pool size",
                     extra={
                         "target_pool_size": target_pool_size,
                         "current_pool_size": pool_total_final,
-                        "reason": "failed" if synthesis_failed else "interrupted",
+                        "replacements_needed": replacements_needed,
+                        "reason": reason,
                     }
                 )
-                asyncio.create_task(self._create_replacement_synthesizer())
+
+                # Create all needed replacements to reach target size
+                for _ in range(replacements_needed):
+                    asyncio.create_task(self._create_replacement_synthesizer())
 
     async def _create_replacement_synthesizer(self) -> None:
         """Create a replacement synthesizer in the background to maintain pool size.

@@ -350,6 +350,15 @@ class SpeechStream(stt.SpeechStream):
             )
 
     def _on_session_started(self, evt: speechsdk.SpeechRecognitionEventArgs) -> None:
+        # Log session ID for debugging
+        session_id = evt.session_id if hasattr(evt, 'session_id') else "unknown"
+        logger.info(
+            "Azure STT session started",
+            extra={
+                "session_id": session_id,
+            }
+        )
+
         self._session_started_event.set()
 
         with contextlib.suppress(RuntimeError):

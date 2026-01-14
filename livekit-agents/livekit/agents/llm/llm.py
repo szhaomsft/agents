@@ -262,6 +262,13 @@ class LLMStream(ABC):
             if ttft == -1.0:
                 ttft = time.perf_counter() - start_time
                 completion_start_time = datetime.now(timezone.utc).isoformat()
+                logger.info(
+                    "LLM first token received",
+                    extra={
+                        "ttft_ms": round(ttft * 1000, 2),
+                        "model": self._llm.model,
+                    },
+                )
 
             if ev.delta:
                 if ev.delta.content:
