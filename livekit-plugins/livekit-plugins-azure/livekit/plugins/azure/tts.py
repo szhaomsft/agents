@@ -237,6 +237,14 @@ class TTS(tts.TTS):
         # Store target pool size for maintaining minimum synthesizers
         self._num_prewarm = num_prewarm
 
+        # Start background task to proactively replace expired synthesizers
+        if num_prewarm > 0:
+            self._maintenance_task: asyncio.Task[None] | None = asyncio.create_task(
+                self._pool_maintenance_loop()
+            )
+        else:
+            self._maintenance_task = None
+
         # Prewarm synthesizers if requested
         if num_prewarm > 0:
             self.prewarm(count=num_prewarm)
@@ -442,6 +450,69 @@ class TTS(tts.TTS):
         # Run prewarm in background
         asyncio.create_task(_prewarm_multiple())
 
+    async def _pool_maintenance_loop(self) -> None:
+        """Background task that proactively replaces expired synthesizers.
+
+        Checks the pool every 30 seconds and removes expired connections,
+        replacing them immediately to maintain target pool size.
+        """
+        import time
+
+        while True:
+            try:
+                await asyncio.sleep(30)  # Check every 30 seconds
+
+                async with self._pool._connect_lock:
+                    now = time.time()
+                    expired_conns = []
+
+                    # Find expired connections in the pool
+                    for conn, created_at in list(self._pool._connections.items()):
+                        if now - created_at > 300:  # max_session_duration
+                            expired_conns.append(conn)
+
+                    if expired_conns:
+                        logger.info(
+                            f"pool maintenance: found {len(expired_conns)} expired synthesizers, replacing",
+                            extra={
+                                "pool_total": len(self._pool._connections),
+                                "pool_available": len(self._pool._available),
+                                "expired_count": len(expired_conns),
+                            }
+                        )
+
+                        # Remove expired connections
+                        for conn in expired_conns:
+                            self._pool.remove(conn)
+
+                        # Drain and close expired connections
+                        await self._pool._drain_to_close()
+
+                        # Create replacements to restore pool to target size
+                        current_size = len(self._pool._connections)
+                        target_size = max(1, self._num_prewarm)
+                        replacements_needed = target_size - current_size
+
+                        for _ in range(replacements_needed):
+                            conn = await self._pool._connect(timeout=30.0)
+                            # Add jitter to stagger future expiries
+                            import random
+                            jitter = random.uniform(-60, 0)
+                            self._pool._connections[conn] += jitter
+                            self._pool.put(conn)
+
+                        logger.info(
+                            f"pool maintenance: created {replacements_needed} replacement synthesizers",
+                            extra={
+                                "pool_total": len(self._pool._connections),
+                                "pool_available": len(self._pool._available),
+                            }
+                        )
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning(f"pool maintenance error: {e}")
+
     def synthesize(
         self,
         text: str,
@@ -458,6 +529,14 @@ class TTS(tts.TTS):
         return stream
 
     async def aclose(self) -> None:
+        # Cancel maintenance task if running
+        if self._maintenance_task and not self._maintenance_task.done():
+            self._maintenance_task.cancel()
+            try:
+                await self._maintenance_task
+            except asyncio.CancelledError:
+                pass
+
         for stream in list(self._streams):
             await stream.aclose()
         self._streams.clear()
@@ -716,9 +795,14 @@ class SynthesizeStream(tts.SynthesizeStream):
                     }
                 )
 
-                # Create all needed replacements to reach target size
-                for _ in range(replacements_needed):
-                    asyncio.create_task(self._create_replacement_synthesizer())
+                # Create replacements synchronously to ensure pool is maintained immediately
+                # This prevents the pool from being empty while background tasks warm up
+                for i in range(replacements_needed):
+                    # Create each replacement as a background task, but they'll start immediately
+                    asyncio.create_task(
+                        self._create_replacement_synthesizer(),
+                        name=f"create_replacement_{i}"
+                    )
 
     async def _create_replacement_synthesizer(self) -> None:
         """Create a replacement synthesizer in the background to maintain pool size.
