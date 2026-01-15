@@ -234,18 +234,8 @@ class TTS(tts.TTS):
             mark_refreshed_on_get=True,
         )
 
-        # Store target pool size for maintaining minimum synthesizers
-        self._num_prewarm = num_prewarm
-
-        # Start background task to proactively replace expired synthesizers
-        if num_prewarm > 0:
-            self._maintenance_task: asyncio.Task[None] | None = asyncio.create_task(
-                self._pool_maintenance_loop()
-            )
-        else:
-            self._maintenance_task = None
-
-        # Prewarm synthesizers if requested
+        # Prewarm a small number of synthesizers for fast first synthesis
+        # Pool will grow on-demand like Cartesia (no background maintenance)
         if num_prewarm > 0:
             self.prewarm(count=num_prewarm)
 
@@ -369,49 +359,30 @@ class TTS(tts.TTS):
     async def _close_synthesizer(self, synthesizer: speechsdk.SpeechSynthesizer) -> None:
         """Close and clean up an Azure Speech synthesizer.
 
+        Non-blocking cleanup that disconnects event handlers and lets
+        the SDK destructor handle WebSocket closure.
+
         Args:
             synthesizer: The synthesizer to close
         """
-        def _sync_close(synth: speechsdk.SpeechSynthesizer) -> None:
-            try:
-                # Stop any ongoing synthesis
-                stop_future = synth.stop_speaking_async()
-                # Wait briefly for stop (with timeout to avoid hanging)
-                try:
-                    stop_future.get()  # This is synchronous
-                except:
-                    pass  # Ignore errors during cleanup
-
-                # Disconnect all event handlers to break references
-                try:
-                    synth.synthesizing.disconnect_all()
-                    synth.synthesis_completed.disconnect_all()
-                    synth.synthesis_canceled.disconnect_all()
-                except:
-                    pass
-
-                # Force connection close by deleting the synthesizer
-                # This triggers the Azure SDK's destructor which closes the WebSocket
-                del synth
-
-            except Exception as e:
-                logger.warning(f"error closing azure synthesizer: {e}")
-
-        # Run cleanup in thread pool
-        loop = asyncio.get_event_loop()
         try:
-            await asyncio.wait_for(
-                loop.run_in_executor(None, lambda: _sync_close(synthesizer)),
-                timeout=2.0  # Short timeout for cleanup
-            )
-            logger.debug("synthesizer connection closed")
-        except asyncio.TimeoutError:
-            logger.warning("timeout closing azure synthesizer")
+            # Disconnect event handlers to prevent callbacks on next use
+            synthesizer.synthesizing.disconnect_all()
+            synthesizer.synthesis_completed.disconnect_all()
+            synthesizer.synthesis_canceled.disconnect_all()
         except Exception as e:
-            logger.warning(f"error closing azure synthesizer: {e}")
+            logger.debug(f"error disconnecting handlers during close: {e}")
+
+        # Delete synthesizer - SDK destructor handles WebSocket cleanup
+        del synthesizer
+        logger.debug("synthesizer closed (non-blocking)")
 
     def prewarm(self, count: int = 1) -> None:
         """Prewarm the connection pool with multiple synthesizers.
+
+        Pool grows on-demand after prewarming (like Cartesia).
+        When a synthesizer is interrupted or expires, ConnectionPool
+        automatically creates a new one on the next get() call.
 
         Args:
             count: Number of synthesizers to create and warm up. Defaults to 1.
@@ -450,69 +421,6 @@ class TTS(tts.TTS):
         # Run prewarm in background
         asyncio.create_task(_prewarm_multiple())
 
-    async def _pool_maintenance_loop(self) -> None:
-        """Background task that proactively replaces expired synthesizers.
-
-        Checks the pool every 30 seconds and removes expired connections,
-        replacing them immediately to maintain target pool size.
-        """
-        import time
-
-        while True:
-            try:
-                await asyncio.sleep(30)  # Check every 30 seconds
-
-                async with self._pool._connect_lock:
-                    now = time.time()
-                    expired_conns = []
-
-                    # Find expired connections in the pool
-                    for conn, created_at in list(self._pool._connections.items()):
-                        if now - created_at > 300:  # max_session_duration
-                            expired_conns.append(conn)
-
-                    if expired_conns:
-                        logger.info(
-                            f"pool maintenance: found {len(expired_conns)} expired synthesizers, replacing",
-                            extra={
-                                "pool_total": len(self._pool._connections),
-                                "pool_available": len(self._pool._available),
-                                "expired_count": len(expired_conns),
-                            }
-                        )
-
-                        # Remove expired connections
-                        for conn in expired_conns:
-                            self._pool.remove(conn)
-
-                        # Drain and close expired connections
-                        await self._pool._drain_to_close()
-
-                        # Create replacements to restore pool to target size
-                        current_size = len(self._pool._connections)
-                        target_size = max(1, self._num_prewarm)
-                        replacements_needed = target_size - current_size
-
-                        for _ in range(replacements_needed):
-                            conn = await self._pool._connect(timeout=30.0)
-                            # Add jitter to stagger future expiries
-                            import random
-                            jitter = random.uniform(-60, 0)
-                            self._pool._connections[conn] += jitter
-                            self._pool.put(conn)
-
-                        logger.info(
-                            f"pool maintenance: created {replacements_needed} replacement synthesizers",
-                            extra={
-                                "pool_total": len(self._pool._connections),
-                                "pool_available": len(self._pool._available),
-                            }
-                        )
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.warning(f"pool maintenance error: {e}")
-
     def synthesize(
         self,
         text: str,
@@ -529,14 +437,6 @@ class TTS(tts.TTS):
         return stream
 
     async def aclose(self) -> None:
-        # Cancel maintenance task if running
-        if self._maintenance_task and not self._maintenance_task.done():
-            self._maintenance_task.cancel()
-            try:
-                await self._maintenance_task
-            except asyncio.CancelledError:
-                pass
-
         for stream in list(self._streams):
             await stream.aclose()
         self._streams.clear()
@@ -758,94 +658,8 @@ class SynthesizeStream(tts.SynthesizeStream):
                 }
             )
 
-            # Proactively create replacement synthesizers when needed
-            # Only create replacements when:
-            # 1. Pool is below target size, OR
-            # 2. All synthesizers are busy (none available)
-            target_pool_size = max(1, self._tts._num_prewarm)
-
-            # Calculate how many we need to reach target size
-            replacements_needed = target_pool_size - pool_total_final
-
-            # Check conditions
-            pool_below_target = pool_total_final < target_pool_size
-            all_busy = pool_available_final == 0
-
-            logger.debug(
-                f"replacement check: synthesis_failed={synthesis_failed}, synthesis_interrupted={synthesis_interrupted}, "
-                f"pool_total_final={pool_total_final}, pool_available_final={pool_available_final}, "
-                f"target_pool_size={target_pool_size}, replacements_needed={replacements_needed}, "
-                f"pool_below_target={pool_below_target}, all_busy={all_busy}"
-            )
-
-            if replacements_needed > 0 and (pool_below_target or all_busy):
-                reason = "below_target" if pool_below_target else "all_busy"
-                if synthesis_failed:
-                    reason = "failed"
-                elif synthesis_interrupted:
-                    reason = "interrupted"
-
-                logger.info(
-                    "creating replacement synthesizers to maintain pool size",
-                    extra={
-                        "target_pool_size": target_pool_size,
-                        "current_pool_size": pool_total_final,
-                        "replacements_needed": replacements_needed,
-                        "reason": reason,
-                    }
-                )
-
-                # Create replacements synchronously to ensure pool is maintained immediately
-                # This prevents the pool from being empty while background tasks warm up
-                for i in range(replacements_needed):
-                    # Create each replacement as a background task, but they'll start immediately
-                    asyncio.create_task(
-                        self._create_replacement_synthesizer(),
-                        name=f"create_replacement_{i}"
-                    )
-
-    async def _create_replacement_synthesizer(self) -> None:
-        """Create a replacement synthesizer in the background to maintain pool size.
-
-        This is called when a synthesizer fails and is removed from the pool.
-        It proactively creates a new synthesizer so the pool remains ready for future requests.
-        """
-        try:
-            async with self._tts._pool._connect_lock:
-                # Check pool size again before creating - other tasks may have already filled it
-                target_pool_size = max(1, self._tts._num_prewarm)
-                current_pool_size = len(self._tts._pool._connections)
-
-                if current_pool_size >= target_pool_size:
-                    logger.debug(
-                        "skipping replacement synthesizer creation - pool already at target size",
-                        extra={
-                            "pool_total": current_pool_size,
-                            "pool_available": len(self._tts._pool._available),
-                            "target_pool_size": target_pool_size,
-                        }
-                    )
-                    return
-
-                # Create and warm up a new synthesizer
-                synthesizer = await self._tts._pool._connect(timeout=30.0)
-                # Add it to the pool
-                self._tts._pool.put(synthesizer)
-                logger.info(
-                    "replacement synthesizer created and added to pool",
-                    extra={
-                        "pool_total": len(self._tts._pool._connections),
-                        "pool_available": len(self._tts._pool._available),
-                    }
-                )
-        except Exception as e:
-            logger.warning(
-                f"failed to create replacement synthesizer: {e}",
-                extra={
-                    "pool_total": len(self._tts._pool._connections),
-                    "pool_available": len(self._tts._pool._available),
-                }
-            )
+            # No on-demand replacements - let pool handle naturally
+            # Background maintenance task will refill pool gradually
 
 
     async def _synthesize_segment(
@@ -1105,18 +919,11 @@ class SynthesizeStream(tts.SynthesizeStream):
             cancelled[0] = True
 
             # Stop the Azure synthesizer to terminate ongoing synthesis
-            # This only stops the current operation, synthesizer can be reused
             try:
                 if synthesizer:
-                    stop_future = synthesizer.stop_speaking_async()
-                    # Wait for stop to complete (with timeout to avoid hanging)
-                    await asyncio.wait_for(
-                        loop.run_in_executor(None, stop_future.get),
-                        timeout=1.0
-                    )
-                    logger.debug("stopped azure synthesizer")
-            except asyncio.TimeoutError:
-                logger.warning("timeout stopping synthesizer")
+                    # Fire-and-forget stop - don't wait for Azure SDK
+                    synthesizer.stop_speaking_async()
+                    logger.debug("stop signal sent (non-blocking)")
             except Exception as e:
                 logger.warning(f"error stopping synthesizer: {e}")
 
@@ -1140,9 +947,9 @@ class SynthesizeStream(tts.SynthesizeStream):
                     await asyncio.wait_for(audio_queue.get(), timeout=0.01)
                 except:
                     break
-            # Don't re-raise - synthesizer was cleanly stopped and can be reused
-            logger.debug("synthesizer stopped cleanly, will be returned to pool")
-            return  # Return instead of raise to allow pool to keep synthesizer
+            # Re-raise to allow pool cleanup logic to remove synthesizer
+            logger.debug("re-raising cancellation to trigger pool cleanup")
+            raise
         except Exception as e:
             # End segment on error
             try:
