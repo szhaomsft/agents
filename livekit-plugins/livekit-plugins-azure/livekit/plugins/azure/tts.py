@@ -609,6 +609,7 @@ class SynthesizeStream(tts.SynthesizeStream):
         synthesis_failed = False
         synthesis_interrupted = False
         synthesizer = None
+        expired_count = 0
         try:
             synthesizer = await self._tts._pool.get(timeout=self._conn_options.timeout)
 
@@ -627,6 +628,23 @@ class SynthesizeStream(tts.SynthesizeStream):
                         "pool_total_after": pool_total_after,
                     }
                 )
+                # Proactively create replacements for expired synthesizers
+                # The pool already created 1 new connection, but it may not be warm yet
+                # Create additional warm synthesizers to maintain target pool size
+                target_size = self._tts._target_pool_size
+                current_size = pool_total_after
+                needed = max(0, target_size - current_size)
+
+                if needed > 0:
+                    logger.info(
+                        f"creating {needed} replacement synthesizer(s) for expired connections",
+                        extra={
+                            "target_pool_size": target_size,
+                            "current_pool_size": current_size,
+                            "expired_count": expired_count,
+                        }
+                    )
+                    asyncio.create_task(self._create_replacement_synthesizers(needed))
 
             logger.info(
                 "synthesizer acquired from pool",
