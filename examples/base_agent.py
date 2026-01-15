@@ -92,7 +92,8 @@ async def my_agent(ctx: JobContext):
         tts=azure.TTS(
             speech_key=os.environ["AZURE_SPEECH_KEY"],
             speech_region=os.environ["AZURE_SPEECH_REGION"],
-            voice="en-IN-Meera:DragonHDLatestNeural"
+            voice="en-IN-Meera:DragonHDLatestNeural",
+            num_prewarm=3  # Each session gets its own pool - 3 is enough for single user with interruptions
         ),
 
         #  tts=inference.TTS(

@@ -227,6 +227,7 @@ class TTS(tts.TTS):
             auth_token=speech_auth_token,
         )
         self._streams = weakref.WeakSet[SynthesizeStream]()
+        self._target_pool_size = num_prewarm  # Track target pool size for replacements
         self._pool = utils.ConnectionPool[speechsdk.SpeechSynthesizer](
             connect_cb=self._create_and_warmup_synthesizer,
             close_cb=self._close_synthesizer,
@@ -534,6 +535,42 @@ class SynthesizeStream(tts.SynthesizeStream):
         self._audio_data: list[bytes] = []
         self._text_data: list[str] = []  # Store text chunks
 
+    async def _create_replacement_synthesizers(self, target_count: int) -> None:
+        """Create replacement synthesizers in the background to maintain pool health.
+
+        Args:
+            target_count: Number of synthesizers to create to reach target pool size
+        """
+        import random
+
+        for i in range(target_count):
+            try:
+                logger.debug(f"creating replacement synthesizer {i + 1}/{target_count} for pool")
+                # Use the pool's connect method which handles locking and jitter
+                async with self._tts._pool._connect_lock:
+                    # Create new synthesizer with longer timeout (Azure warmup takes 2-3s)
+                    conn = await self._tts._pool._connect(timeout=30.0)
+
+                    # Add random jitter to prevent simultaneous expiry
+                    jitter = random.uniform(-60, 0)
+                    self._tts._pool._connections[conn] += jitter
+
+                    self._tts._pool.put(conn)
+                    logger.info(
+                        f"replacement synthesizer {i + 1}/{target_count} created",
+                        extra={
+                            "pool_total": len(self._tts._pool._connections),
+                            "pool_available": len(self._tts._pool._available),
+                        }
+                    )
+            except Exception as e:
+                logger.warning(f"failed to create replacement synthesizer {i + 1}/{target_count}: {e}")
+
+            # Sleep between creations to avoid thundering herd
+            # Skip sleep after last iteration
+            if i < target_count - 1:
+                await asyncio.sleep(0.5)
+
     async def _run(self, output_emitter: tts.AudioEmitter) -> None:
         request_id = utils.shortuuid()
         output_emitter.initialize(
@@ -658,8 +695,23 @@ class SynthesizeStream(tts.SynthesizeStream):
                 }
             )
 
-            # No on-demand replacements - let pool handle naturally
-            # Background maintenance task will refill pool gradually
+            # Proactively replace interrupted or failed synthesizers to maintain pool health
+            if synthesis_failed or synthesis_interrupted:
+                # Calculate how many synthesizers needed to reach target pool size
+                target_size = self._tts._target_pool_size
+                current_size = pool_total_final
+                needed = max(0, target_size - current_size)
+
+                if needed > 0:
+                    logger.info(
+                        f"proactively creating {needed} replacement synthesizer(s) to reach target pool size",
+                        extra={
+                            "target_pool_size": target_size,
+                            "current_pool_size": current_size,
+                            "replacements_needed": needed,
+                        }
+                    )
+                    asyncio.create_task(self._create_replacement_synthesizers(needed))
 
 
     async def _synthesize_segment(
@@ -687,6 +739,10 @@ class SynthesizeStream(tts.SynthesizeStream):
 
         def _run_sdk_synthesis() -> None:
             """Run Azure SDK synthesis in sync mode with streaming callbacks."""
+            import threading
+            thread_id = threading.current_thread().ident
+            logger.debug(f"SDK synthesis thread started (thread_id={thread_id})")
+
             def synthesizing_callback(evt):
                 """Called when audio chunks are available during synthesis."""
                 import time
@@ -732,6 +788,9 @@ class SynthesizeStream(tts.SynthesizeStream):
             def canceled_callback(evt):
                 """Called when synthesis is canceled or fails."""
                 cancellation = evt.result.cancellation_details
+
+                # Signal that synthesis is complete (even though cancelled)
+                synthesis_complete_event.set()
 
                 # Check if this was a user cancellation (synthesizer still healthy)
                 # vs a server/connection error (synthesizer broken)
@@ -796,7 +855,7 @@ class SynthesizeStream(tts.SynthesizeStream):
                 result = result_future.get()
 
                 # Wait for synthesis_complete_event from completed_callback
-                synthesis_complete_event.wait(timeout=5.0)
+                synthesis_complete_event.wait(timeout=1.0)
 
                 # Now wait for all audio chunks to be queued by acquiring the lock
                 # This ensures any in-flight synthesizing_callback calls complete
@@ -820,6 +879,8 @@ class SynthesizeStream(tts.SynthesizeStream):
                     synthesizer.synthesis_canceled.disconnect_all()
                 except:
                     pass
+
+            logger.debug(f"SDK synthesis thread exiting (thread_id={thread_id})")
 
         async def _stream_text_input() -> None:
             """Stream text chunks to the SDK as they arrive."""
@@ -869,6 +930,7 @@ class SynthesizeStream(tts.SynthesizeStream):
         try:
             # Start SDK synthesis in thread pool
             synthesis_task = loop.run_in_executor(None, _run_sdk_synthesis)
+            logger.debug(f"Started synthesis_task in thread pool executor")
 
             # Run text streaming and audio receiving concurrently
             await asyncio.gather(
@@ -881,7 +943,9 @@ class SynthesizeStream(tts.SynthesizeStream):
                 raise synthesis_error[0]
 
             # Wait for synthesis thread to complete
+            logger.debug("Waiting for synthesis_task to complete (success path)")
             await synthesis_task
+            logger.debug("synthesis_task completed successfully")
 
             output_emitter.end_segment()
 
@@ -929,6 +993,8 @@ class SynthesizeStream(tts.SynthesizeStream):
 
             # Signal SDK thread to stop
             text_queue.put(None)
+            logger.debug("Sent None to text_queue to signal SDK thread to stop")
+
             # Flush any queued audio immediately
             output_emitter.flush()
             # End segment on cancellation
@@ -947,6 +1013,8 @@ class SynthesizeStream(tts.SynthesizeStream):
                     await asyncio.wait_for(audio_queue.get(), timeout=0.01)
                 except:
                     break
+
+
             # Re-raise to allow pool cleanup logic to remove synthesizer
             logger.debug("re-raising cancellation to trigger pool cleanup")
             raise
@@ -967,4 +1035,5 @@ class SynthesizeStream(tts.SynthesizeStream):
                     await asyncio.wait_for(audio_queue.get(), timeout=0.01)
                 except:
                     break
+
             raise APIConnectionError(f"Azure SDK synthesis failed: {e}") from e
