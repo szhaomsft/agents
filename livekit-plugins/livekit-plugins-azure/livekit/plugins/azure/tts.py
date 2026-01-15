@@ -160,7 +160,7 @@ class TTS(tts.TTS):
         deployment_id: str | None = None,
         speech_auth_token: str | None = None,
         http_session: aiohttp.ClientSession | None = None,
-        num_prewarm: int = 10,
+        num_prewarm: int = 3,
     ) -> None:
         """
         Create a new instance of Azure TTS.
