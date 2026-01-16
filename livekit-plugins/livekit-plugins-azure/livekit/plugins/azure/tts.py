@@ -331,7 +331,7 @@ class TTS(tts.TTS):
                 input_type=speechsdk.SpeechSynthesisRequestInputType.TextStream
             )
             warmup_task = synthesizer.speak_async(warmup_request)
-            warmup_request.input_stream.write("Warm up.")
+            # warmup_request.input_stream.write("Warm up.")
             warmup_request.input_stream.close()
             warmup_result = warmup_task.get()
 
@@ -759,7 +759,7 @@ class SynthesizeStream(tts.SynthesizeStream):
             """Run Azure SDK synthesis in sync mode with streaming callbacks."""
             import threading
             thread_id = threading.current_thread().ident
-            logger.debug(f"SDK synthesis thread started (thread_id={thread_id})")
+            logger.debug(f"\033[92mSDK synthesis thread started (thread_id={thread_id})\033[0m")
 
             def synthesizing_callback(evt):
                 """Called when audio chunks are available during synthesis."""
@@ -848,7 +848,11 @@ class SynthesizeStream(tts.SynthesizeStream):
                     if cancelled[0]:
                         logger.debug("sdk thread detected cancellation, stopping text streaming")
                         break
-                    text_piece = text_queue.get()  # Blocking get in sync thread
+                    try:
+                        # Use timeout to periodically check cancelled flag and avoid hang
+                        text_piece = text_queue.get(timeout=0.1)
+                    except queue.Empty:
+                        continue  # Check cancelled flag and try again
                     if text_piece is None:
                         break
                     if cancelled[0]:
@@ -862,24 +866,29 @@ class SynthesizeStream(tts.SynthesizeStream):
                         logger.debug("sending first text chunk to Azure TTS")
 
                     tts_request.input_stream.write(text_piece)
-                    # Log each chunk as it's streamed
-                    logger.info("streaming tts chunk", extra={"chunk": chunk_count[0], "text": text_piece})
+                    # Log every 20 chunks to reduce log verbosity
+                    if chunk_count[0] % 20 == 0:
+                        logger.info("streaming tts chunk", extra={"chunk": chunk_count[0], "text": text_piece})
 
                 # Close input stream to signal completion
                 tts_request.input_stream.close()
 
-                # Wait for synthesis to complete
-                # This blocks until the SDK finishes and callbacks fire
-                result = result_future.get()
+                # Wait for synthesis to complete with timeout to prevent hanging
+                # Poll with timeout to allow checking cancelled flag
+                result = None
+                while not cancelled[0]:
+                    # Wait for completion event with short timeout
+                    if synthesis_complete_event.wait(timeout=0.1):
+                        # Event was set, get the result (should be ready now)
+                        result = result_future.get()
+                        break
 
-                # Wait for synthesis_complete_event from completed_callback
-                synthesis_complete_event.wait(timeout=1.0)
-
+     
                 # Now wait for all audio chunks to be queued by acquiring the lock
                 # This ensures any in-flight synthesizing_callback calls complete
                 with audio_lock:
                     logger.debug(f"Synthesis result received, {audio_chunks_queued[0]} total chunks queued")
-                    if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
+                    if result and result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
                         asyncio.run_coroutine_threadsafe(audio_queue.put(None), loop)
 
                 # Disconnect event handlers to prevent them from firing on next use
@@ -898,7 +907,7 @@ class SynthesizeStream(tts.SynthesizeStream):
                 except:
                     pass
 
-            logger.debug(f"SDK synthesis thread exiting (thread_id={thread_id})")
+            logger.debug(f"\033[93mSDK synthesis thread exiting (thread_id={thread_id})\033[0m")
 
         async def _stream_text_input() -> None:
             """Stream text chunks to the SDK as they arrive."""
