@@ -450,6 +450,12 @@ class RealtimeSession(
 
         elif event_type == ServerEventType.ERROR:
             error_msg = getattr(event, "error", {}).get("message", "Unknown error")
+            # Suppress "no active response" errors - these are harmless race conditions
+            # that occur when a cancellation request arrives after a response completed
+            error_lower = error_msg.lower()
+            if "no active response" in error_lower or "response_cancel_not_active" in error_lower:
+                logger.debug(f"Azure Voice Live (suppressed): {error_msg}")
+                return
             logger.error(f"Azure Voice Live error: {error_msg}")
             self._emit_error(APIError(error_msg), recoverable=True)
 
