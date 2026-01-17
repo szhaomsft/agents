@@ -114,7 +114,7 @@ class RealtimeModel(llm.RealtimeModel):
         self,
         *,
         endpoint: str | None = None,
-        model: str = "gpt-4o-realtime-preview",
+        model: str = "gpt-realtime",
         voice: str = DEFAULT_VOICE,
         modalities: NotGivenOr[list[Literal["text", "audio"]]] = NOT_GIVEN,
         turn_detection: NotGivenOr[ServerVad | None] = NOT_GIVEN,
@@ -131,7 +131,7 @@ class RealtimeModel(llm.RealtimeModel):
 
         Args:
             endpoint: Azure Voice Live endpoint URL (wss://...). If None, reads from AZURE_VOICELIVE_ENDPOINT.
-            model: Model name (default: "gpt-4o-realtime-preview").
+            model: Model name (default: "gpt-realtime").
             voice: Voice for audio responses (default: "en-US-AvaNeural").
             modalities: List of modalities to enable (default: ["text", "audio"]).
             turn_detection: Server-side VAD configuration (default: ServerVad with threshold=0.5).
@@ -159,6 +159,7 @@ class RealtimeModel(llm.RealtimeModel):
         modalities_list = modalities if is_given(modalities) else DEFAULT_MODALITIES
         turn_detection_val = to_turn_detection(turn_detection)
 
+        logger.info(f"[AZURE_INIT] model: {model}")
         logger.info(f"[AZURE_INIT] turn_detection parameter: {turn_detection}")
         logger.info(f"[AZURE_INIT] turn_detection_val after to_turn_detection: {turn_detection_val}")
         logger.info(f"[AZURE_INIT] turn_detection capability will be: {turn_detection_val is not None}")
@@ -300,6 +301,13 @@ class RealtimeSession(
                 await self._run_connection()
                 break
             except APIError as e:
+                # Server disconnect (idle timeout) - always reconnect without counting retries
+                if "Server closed connection" in str(e):
+                    self._emit_error(e, recoverable=True)
+                    # Brief delay before reconnecting
+                    await asyncio.sleep(0.5)
+                    continue
+
                 if max_retries == 0 or not e.retryable:
                     self._emit_error(e, recoverable=False)
                     raise
@@ -347,8 +355,14 @@ class RealtimeSession(
                 async for event in conn:
                     await self._handle_event(event)
 
-                logger.warning("Event loop ended - connection closed by server")
+                # Server closed connection - trigger reconnect
+                print("\033[43m\033[30m [AZURE] Server disconnected, reconnecting... \033[0m")
+                logger.warning("Event loop ended - connection closed by server, will reconnect")
+                raise APIError("Server closed connection", retryable=True)
 
+        except APIError:
+            # Re-raise APIError to trigger retry logic in _main_task
+            raise
         except Exception as e:
             logger.error(f"Azure Voice Live connection error: {e}", exc_info=True)
             raise APIConnectionError(f"Azure Voice Live connection error: {e}") from e
