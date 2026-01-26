@@ -276,7 +276,7 @@ class TTS(tts.TTS):
         """Create and warm up a new Azure Speech synthesizer.
 
         This runs in a thread pool since Azure SDK is synchronous.
-        Each synthesizer gets its own warmup - no shared state.
+        Uses Connection.from_speech_synthesizer() and connection.open() to pre-connect.
 
         Args:
             timeout: Connection timeout in seconds
@@ -285,6 +285,7 @@ class TTS(tts.TTS):
             Warmed-up synthesizer ready for use
         """
         def _sync_create_and_warmup() -> speechsdk.SpeechSynthesizer:
+            import threading
             import time
 
             # Build WebSocket v2 endpoint
@@ -324,24 +325,40 @@ class TTS(tts.TTS):
                 speech_config=speech_config, audio_config=None
             )
 
-            # Warm up synthesizer
-            logger.info("warming up azure tts synthesizer")
+            # Pre-connect using Connection.from_speech_synthesizer() and open()
+            logger.info("pre-connecting azure tts synthesizer")
             warmup_start = time.time()
-            warmup_request = speechsdk.SpeechSynthesisRequest(
-                input_type=speechsdk.SpeechSynthesisRequestInputType.TextStream
-            )
-            warmup_task = synthesizer.speak_async(warmup_request)
-            # warmup_request.input_stream.write("Warm up.")
-            warmup_request.input_stream.close()
-            warmup_result = warmup_task.get()
 
-            if warmup_result.reason != speechsdk.ResultReason.SynthesizingAudioCompleted:
-                raise APIConnectionError(
-                    f"Azure TTS warmup failed: {warmup_result.cancellation_details.reason}"
-                )
+            # Get connection from synthesizer
+            connection = speechsdk.Connection.from_speech_synthesizer(synthesizer)
+
+            # Use threading event to wait for connection
+            connected_event = threading.Event()
+
+            def on_connected(evt):
+                logger.debug("synthesizer connected callback received")
+                connected_event.set()
+
+            def on_disconnected(evt):
+                logger.debug("synthesizer disconnected callback received")
+
+            # Subscribe to connection events
+            connection.connected.connect(on_connected)
+            connection.disconnected.connect(on_disconnected)
+
+            # Open connection (for_continuous_recognition has no effect for synthesizer)
+            connection.open(for_continuous_recognition=True)
+
+            # Wait for connection to be established
+            if not connected_event.wait(timeout=timeout):
+                raise APIConnectionError("Azure TTS pre-connect timed out waiting for connection")
+
+            # Disconnect event handlers after successful connection
+            connection.connected.disconnect_all()
+            connection.disconnected.disconnect_all()
 
             warmup_time = time.time() - warmup_start
-            logger.info("azure tts warmup completed", extra={"duration": f"{warmup_time:.3f}s"})
+            logger.info("azure tts pre-connect completed", extra={"duration": f"{warmup_time:.3f}s"})
 
             return synthesizer
 
