@@ -703,6 +703,7 @@ class SynthesizeStream(tts.SynthesizeStream):
                 synthesis_failed = True
                 raise APIConnectionError(str(e)) from e
             finally:
+                logger.debug("cancelling forward_input and synthesis tasks")
                 await utils.aio.gracefully_cancel(*tasks)
 
             # Success - return synthesizer to pool
@@ -712,6 +713,7 @@ class SynthesizeStream(tts.SynthesizeStream):
             # If synthesizer wasn't returned yet, remove it from pool
             # (either failed or interrupted - both need fresh synthesizer)
             if synthesizer is not None:
+                logger.debug("removing synthesizer from pool due to failure/interrupt")
                 self._tts._pool.remove(synthesizer)
                 # Immediately close the connection instead of waiting for next drain cycle
                 await self._tts._pool._drain_to_close()
@@ -758,7 +760,6 @@ class SynthesizeStream(tts.SynthesizeStream):
                     )
                     asyncio.create_task(self._create_replacement_synthesizers(needed))
 
-
     async def _synthesize_segment(
         self, output_emitter: tts.AudioEmitter, synthesizer: speechsdk.SpeechSynthesizer
     ) -> None:
@@ -787,6 +788,26 @@ class SynthesizeStream(tts.SynthesizeStream):
             import threading
             thread_id = threading.current_thread().ident
             logger.debug(f"\033[92mSDK synthesis thread started (thread_id={thread_id})\033[0m")
+            # Send audio to async queue (thread-safe)
+            async def _put_audio(audio_chunk,reason=None):
+                # await asyncio.sleep(0.2)
+                await audio_queue.put(audio_chunk)
+                if audio_chunk:
+                    logger.debug(
+                        "_put_audio",
+                        extra={
+                            "chunk_number": audio_chunks_from_sdk[0],
+                            "chunk_size": len(audio_chunk),
+                        },
+                    )    
+                if reason:
+                    logger.debug(
+                        "_put_audio",
+                        extra={
+                            "reason": reason,
+                        },
+                    )
+
 
             def synthesizing_callback(evt):
                 """Called when audio chunks are available during synthesis."""
@@ -817,8 +838,7 @@ class SynthesizeStream(tts.SynthesizeStream):
                                 }
                             )
 
-                        # Send audio to async queue (thread-safe)
-                        future = asyncio.run_coroutine_threadsafe(audio_queue.put(audio_chunk), loop)
+                        future = asyncio.run_coroutine_threadsafe(_put_audio(audio_chunk), loop)
                         # Wait for it to complete to ensure ordering
                         future.result()
                         audio_chunks_queued[0] += 1
@@ -844,7 +864,7 @@ class SynthesizeStream(tts.SynthesizeStream):
                     logger.debug(f"synthesis cancelled by user: {cancellation.error_details}")
                     # Don't add to synthesis_error - this is not a failure
                     # Signal completion normally
-                    asyncio.run_coroutine_threadsafe(audio_queue.put(None), loop)
+                    asyncio.run_coroutine_threadsafe(_put_audio(None, reason=cancellation.error_details), loop)
                 else:
                     # Real error (connection error, server error, etc.)
                     error = APIStatusError(
@@ -853,8 +873,7 @@ class SynthesizeStream(tts.SynthesizeStream):
                     )
                     synthesis_error.append(error)
                     # Signal error completion
-                    asyncio.run_coroutine_threadsafe(audio_queue.put(None), loop)
-
+                    asyncio.run_coroutine_threadsafe(_put_audio(None, reason=cancellation.error_details), loop)
             # Connect event handlers
             synthesizer.synthesizing.connect(synthesizing_callback)
             synthesizer.synthesis_completed.connect(completed_callback)
@@ -908,6 +927,7 @@ class SynthesizeStream(tts.SynthesizeStream):
                     if synthesis_complete_event.wait(timeout=0.1):
                         # Event was set, get the result (should be ready now)
                         result = result_future.get()
+                        logger.debug(f"synthesis complete event set, retrieving result{result.reason}")
                         break
 
      
@@ -916,7 +936,7 @@ class SynthesizeStream(tts.SynthesizeStream):
                 with audio_lock:
                     logger.debug(f"Synthesis result received, {audio_chunks_queued[0]} total chunks queued")
                     if result and result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
-                        asyncio.run_coroutine_threadsafe(audio_queue.put(None), loop)
+                        asyncio.run_coroutine_threadsafe(_put_audio(None, reason="SynthesizingAudioCompleted"), loop)
 
                 # Disconnect event handlers to prevent them from firing on next use
                 synthesizer.synthesizing.disconnect_all()
@@ -925,7 +945,7 @@ class SynthesizeStream(tts.SynthesizeStream):
 
             except Exception as e:
                 synthesis_error.append(e)
-                asyncio.run_coroutine_threadsafe(audio_queue.put(None), loop)
+                asyncio.run_coroutine_threadsafe(_put_audio(None, reason=str(e)), loop)
                 # Disconnect handlers even on error
                 try:
                     synthesizer.synthesizing.disconnect_all()
@@ -950,7 +970,7 @@ class SynthesizeStream(tts.SynthesizeStream):
                 text_queue.put(text_chunk)
             # Signal end of text
             text_queue.put(None)
-  
+
         async def _receive_audio() -> None:
             """Receive audio chunks as they arrive."""
             chunk_count = 0
@@ -1049,6 +1069,16 @@ class SynthesizeStream(tts.SynthesizeStream):
             text_queue.put(None)
             logger.debug("Sent None to text_queue to signal SDK thread to stop")
 
+            # Wait for SDK thread to complete before cleanup
+            # This ensures the thread releases its hold on the synthesizer
+            try:
+                await asyncio.wait_for(synthesis_task, timeout=2.0)
+                logger.debug("synthesis_task completed after cancellation")
+            except asyncio.TimeoutError:
+                logger.warning("synthesis_task did not complete within timeout")
+            except Exception as e:
+                logger.debug(f"synthesis_task error during cleanup: {e}")
+
             # Flush any queued audio immediately
             output_emitter.flush()
             # End segment on cancellation
@@ -1067,7 +1097,6 @@ class SynthesizeStream(tts.SynthesizeStream):
                     await asyncio.wait_for(audio_queue.get(), timeout=0.01)
                 except:
                     break
-
 
             # Re-raise to allow pool cleanup logic to remove synthesizer
             logger.debug("re-raising cancellation to trigger pool cleanup")
