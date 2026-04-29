@@ -315,6 +315,13 @@ class TTS(tts.TTS):
             # Set voice and output format
             speech_config.speech_synthesis_voice_name = self._opts.voice
 
+            # Disable compressed audio transmission to avoid codec issues
+            # Force truly uncompressed audio over WebSocket
+            speech_config.set_property(
+                speechsdk.PropertyId.SpeechServiceConnection_SynthEnableCompressedAudioTransmission,
+                "false"
+            )
+
             # Use SDK format if available
             if self._opts.sample_rate in SDK_OUTPUT_FORMATS:
                 speech_config.set_speech_synthesis_output_format(
