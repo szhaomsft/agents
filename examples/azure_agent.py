@@ -88,7 +88,7 @@ async def entrypoint(ctx: JobContext):
 
     # Create Azure TTS with sentence logging
     azure_tts = azure.TTS(
-        voice=os.getenv("AZURE_SPEECH_VOICE", "en-US-Tessa:DragonHDLatestNeural"),
+        voice=os.getenv("AZURE_SPEECH_VOICE", "en-US-JennyNeural"),
     )
 
     # Wrap synthesize method to log sentences
