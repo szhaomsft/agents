@@ -529,29 +529,28 @@ class SynthesizeStream(tts.SynthesizeStream):
         synthesis_error: list[Exception] = []
         text_queue: queue.Queue[str | None] = queue.Queue()  # Sync queue for thread-safe access
         cancelled = [False]  # Flag to signal cancellation to SDK thread
+        callback_audio = bytearray()
 
         # Get the event loop before entering the thread
         loop = asyncio.get_event_loop()
 
+        def _enqueue_audio(audio: bytes | None) -> None:
+            loop.call_soon_threadsafe(audio_queue.put_nowait, audio)
+
         def _run_sdk_synthesis() -> None:
-            """Run Azure SDK synthesis in sync mode with streaming callbacks."""            
+            """Run Azure SDK synthesis in sync mode with streaming callbacks."""
+
             def synthesizing_callback(evt):
                 """Called when audio chunks are available during synthesis."""
-                import time
                 if cancelled[0]:
                     return  # Discard audio if cancelled
                 if evt.result.audio_data:
                     # Raw PCM format - no headers to strip
                     audio_chunk = evt.result.audio_data
+                    callback_audio.extend(audio_chunk)
 
-                    # print(f"  [SDK Callback {time.time():.3f}] Received audio chunk: {len(audio_chunk)} bytes")
                     # Send audio to async queue (thread-safe)
-                    asyncio.run_coroutine_threadsafe(audio_queue.put(audio_chunk), loop)
-
-            def completed_callback(evt):
-                """Called when synthesis completes successfully."""
-                # Signal completion with None
-                asyncio.run_coroutine_threadsafe(audio_queue.put(None), loop)
+                    _enqueue_audio(audio_chunk)
 
             def canceled_callback(evt):
                 """Called when synthesis is canceled or fails."""
@@ -561,12 +560,9 @@ class SynthesizeStream(tts.SynthesizeStream):
                     f"Error: {cancellation.error_details}"
                 )
                 synthesis_error.append(error)
-                # Signal error completion
-                asyncio.run_coroutine_threadsafe(audio_queue.put(None), loop)
 
             # Connect event handlers
             self._tts._synthesizer.synthesizing.connect(synthesizing_callback)
-            self._tts._synthesizer.synthesis_completed.connect(completed_callback)
             self._tts._synthesizer.synthesis_canceled.connect(canceled_callback)
 
             # Create streaming request
@@ -600,14 +596,20 @@ class SynthesizeStream(tts.SynthesizeStream):
                 # Wait for synthesis to complete
                 # This blocks until the SDK finishes and callbacks fire
                 result = result_future.get()
-                
-                # Ensure completion signal is sent
-                if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
-                    asyncio.run_coroutine_threadsafe(audio_queue.put(None), loop)
-                
+                result_audio = bytes(result.audio_data)
+                delivered_audio = bytes(callback_audio)
+                if len(result_audio) > len(delivered_audio):
+                    if not result_audio.startswith(delivered_audio):
+                        raise APIConnectionError(
+                            "Azure TTS callback audio does not match the final synthesis result"
+                        )
+                    _enqueue_audio(result_audio[len(delivered_audio) :])
             except Exception as e:
                 synthesis_error.append(e)
-                asyncio.run_coroutine_threadsafe(audio_queue.put(None), loop)
+            finally:
+                # Queue completion only after speak_async has returned, when all
+                # synthesizing callbacks have queued their final audio chunks.
+                _enqueue_audio(None)
 
         async def _stream_text_input() -> None:
             """Stream text chunks to the SDK as they arrive."""
