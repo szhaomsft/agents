@@ -30,6 +30,7 @@ from livekit.agents import (
     DEFAULT_API_CONNECT_OPTIONS,
     APIConnectOptions,
     APIStatusError,
+    LanguageCode,
     stt,
     utils,
 )
@@ -56,8 +57,7 @@ class STTOptions:
     buffer_size_seconds: float = 0.08
     encoding: str = "pcm_s16le"
     temperature: float | None = None
-    # TODO(laurent): support language detection
-    language: str = "en"
+    language: LanguageCode = LanguageCode("en")
     vad_threshold: float = 0.6
     vad_bucket: int | None = 2
     # When set, we flush the stt state on the first time the VAD triggers
@@ -70,7 +70,7 @@ class STT(stt.STT):
         self,
         *,
         api_key: str | None = None,
-        model_endpoint: str | None = "wss://eu.api.gradium.ai/api/speech/asr",
+        model_endpoint: str | None = None,
         model_name: str = "default",
         sample_rate: int = SUPPORTED_SAMPLE_RATE,
         encoding: NotGivenOr[STTEncoding] = NOT_GIVEN,
@@ -80,6 +80,7 @@ class STT(stt.STT):
         vad_bucket: int | None = 2,
         vad_flush: bool = True,
         temperature: float | None = None,
+        language: str = "en",
     ):
         super().__init__(
             capabilities=stt.STTCapabilities(
@@ -104,12 +105,11 @@ class STT(stt.STT):
 
         self._api_key = api_key
 
-        model_endpoint = model_endpoint or os.environ.get("GRADIUM_MODEL_ENDPOINT")
-
-        if not model_endpoint:
-            raise ValueError(
-                "The model endpoint is required, you can find it in the Gradium dashboard"
-            )
+        model_endpoint = (
+            model_endpoint
+            or os.environ.get("GRADIUM_MODEL_ENDPOINT")
+            or "wss://api.gradium.ai/api/speech/asr"
+        )
 
         self._model_endpoint = model_endpoint
         self._model_name = model_name
@@ -121,6 +121,7 @@ class STT(stt.STT):
             vad_bucket=vad_bucket,
             vad_flush=vad_flush,
             temperature=temperature,
+            language=LanguageCode(language),
         )
 
         if is_given(encoding):
@@ -159,6 +160,8 @@ class STT(stt.STT):
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
     ) -> SpeechStream:
         config = dataclasses.replace(self._opts)
+        if is_given(language):
+            config.language = LanguageCode(language)
         stream = SpeechStream(
             stt=self,
             conn_options=conn_options,
@@ -288,7 +291,11 @@ class SpeechStream(stt.SpeechStream):
                 ):
                     if closing_ws:
                         return
-                    raise APIStatusError("Gradium connection closed unexpectedly")
+                    raise APIStatusError(
+                        "Gradium connection closed unexpectedly",
+                        status_code=ws.close_code or -1,
+                        body=f"{msg.data=} {msg.extra=}",
+                    )
 
                 if msg.type != aiohttp.WSMsgType.TEXT:
                     logger.error("Unexpected Gradium message type: %s", msg.type)
@@ -414,8 +421,10 @@ class SpeechStream(stt.SpeechStream):
             "model_name": self._model_name,
             "input_format": "pcm",
         }
+        json_config: dict[str, Any] = {"language": self._opts.language.language}
         if self._opts.temperature is not None:
-            setup_msg["json_config"] = {"temp": self._opts.temperature}
+            json_config["temp"] = self._opts.temperature
+        setup_msg["json_config"] = json_config
 
         await ws.send_str(json.dumps(setup_msg))
         return ws

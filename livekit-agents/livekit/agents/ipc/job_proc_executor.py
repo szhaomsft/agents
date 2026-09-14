@@ -4,9 +4,9 @@ import asyncio
 import logging
 import multiprocessing as mp
 import socket
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from multiprocessing.context import BaseContext
-from typing import Any, Callable
+from typing import Any
 
 from ..job import JobContext, JobProcess, RunningJobInfo
 from ..log import logger
@@ -16,7 +16,7 @@ from . import channel, proto
 from .inference_executor import InferenceExecutor
 from .job_executor import JobStatus
 from .job_proc_lazy_main import ProcStartArgs, proc_main
-from .supervised_proc import SupervisedProc
+from .supervised_proc import SupervisedProc, SupervisedProcKind
 
 
 class ProcJobExecutor(SupervisedProc):
@@ -26,9 +26,11 @@ class ProcJobExecutor(SupervisedProc):
         initialize_process_fnc: Callable[[JobProcess], Any],
         job_entrypoint_fnc: Callable[[JobContext], Awaitable[None]],
         session_end_fnc: Callable[[JobContext], Awaitable[None]] | None,
+        simulation_end_fnc: Callable[[Any], Any] | None,
         inference_executor: InferenceExecutor | None,
         initialize_timeout: float,
         close_timeout: float,
+        session_end_timeout: float,
         memory_warn_mb: float,
         memory_limit_mb: float,
         ping_interval: float,
@@ -57,13 +59,19 @@ class ProcJobExecutor(SupervisedProc):
         self._initialize_process_fnc = initialize_process_fnc
         self._job_entrypoint_fnc = job_entrypoint_fnc
         self._session_end_fnc = session_end_fnc
+        self._simulation_end_fnc = simulation_end_fnc
+        self._session_end_timeout = session_end_timeout
         self._inference_executor = inference_executor
-        self._inference_tasks: list[asyncio.Task[None]] = []
+        self._inference_tasks: set[asyncio.Task[None]] = set()
         self._id = shortuuid("PCEXEC_")
 
     @property
     def id(self) -> str:
         return self._id
+
+    @property
+    def process_kind(self) -> SupervisedProcKind:
+        return SupervisedProcKind.JOB
 
     @property
     def status(self) -> JobStatus:
@@ -97,6 +105,8 @@ class ProcJobExecutor(SupervisedProc):
             initialize_process_fnc=self._initialize_process_fnc,
             job_entrypoint_fnc=self._job_entrypoint_fnc,
             session_end_fnc=self._session_end_fnc,
+            simulation_end_fnc=self._simulation_end_fnc,
+            session_end_timeout=self._session_end_timeout,
             log_cch=log_cch,
             mp_cch=cch,
             user_arguments=self._user_args,
@@ -112,7 +122,9 @@ class ProcJobExecutor(SupervisedProc):
         try:
             async for msg in ipc_ch:
                 if isinstance(msg, proto.InferenceRequest):
-                    self._inference_tasks.append(asyncio.create_task(self._do_inference_task(msg)))
+                    task = asyncio.create_task(self._do_inference_task(msg))
+                    self._inference_tasks.add(task)
+                    task.add_done_callback(self._inference_tasks.discard)
         finally:
             await aio.cancel_and_wait(*self._inference_tasks)
 
@@ -162,13 +174,19 @@ class ProcJobExecutor(SupervisedProc):
 
         start_req = proto.StartJobRequest()
         start_req.running_job = info
-        await channel.asend_message(self._pch, start_req)
+        try:
+            await channel.asend_message(self._pch, start_req)
+        except Exception:
+            self._running_job = None
+            self._job_status = None
+            metrics.job_ended()
+            raise
 
     def logging_extra(self) -> dict[str, Any]:
         extra = super().logging_extra()
 
         if self._running_job:
             extra["job_id"] = self._running_job.job.id
-            extra["room_id"] = self._running_job.job.room.sid
+            extra["room"] = self._running_job.job.room.name
 
         return extra

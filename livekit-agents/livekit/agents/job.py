@@ -15,47 +15,92 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import contextvars
 import functools
 import inspect
 import json
 import logging
 import multiprocessing as mp
+import os
 import tempfile
-from collections.abc import Coroutine
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from enum import Enum, unique
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, cast
+from typing import TYPE_CHECKING, Any, Literal, overload
 from urllib.parse import urlparse
 
 import aiohttp
-from opentelemetry import trace
 
 from livekit import api, rtc
 from livekit.api.access_token import Claims
 from livekit.protocol import agent, models
 
 from .log import logger
-from .telemetry import _upload_session_report, trace_types, tracer
-from .telemetry.traces import _setup_cloud_tracer, _shutdown_telemetry
-from .types import NotGivenOr
+from .observability import Tagger
+from .telemetry import (
+    _upload_session_report,
+    otel_metrics,
+    rpc as rpc_tracing,
+    session_context,
+    trace_types,
+    utils as telemetry_utils,
+)
+from .telemetry.traces import (
+    _BufferingHandler,
+    _cloud_log_handler,
+    _discard_cloud_tracer,
+    _JobTelemetry,
+    _prepare_cloud_tracer,
+    _setup_cloud_tracer,
+    _shutdown_telemetry,
+)
+from .types import (
+    ATTRIBUTE_REDACTION_ENABLED,
+    ATTRIBUTE_SIMULATION_ENABLED,
+    ATTRIBUTE_SIMULATION_JOB_ID,
+    ATTRIBUTE_SIMULATION_RUN_ID,
+    ATTRIBUTE_SIMULATOR,
+    ATTRIBUTE_SIMULATOR_DISPATCH,
+    NotGivenOr,
+    recording_enabled,
+)
 from .utils import http_context, is_given, wait_for_participant
+from .utils.deprecation import deprecate_params
 from .utils.misc import is_cloud
 
 _JobContextVar = contextvars.ContextVar["JobContext"]("agents_job_context")
 
 
+def _observability_url(livekit_url: str) -> str | None:
+    """Return the observability endpoint, or None if observability is unavailable."""
+    url = os.environ.get("LIVEKIT_OBSERVABILITY_URL")
+    if url:
+        return url
+    hostname = urlparse(livekit_url).hostname
+    if hostname and is_cloud(livekit_url):
+        return f"https://{hostname}"
+    return None
+
+
 if TYPE_CHECKING:
     from .ipc.inference_executor import InferenceExecutor
-    from .voice.agent_session import AgentSession
+    from .simulation import SimulationContext
+    from .voice.agent_session import AgentSession, RecordingOptions
     from .voice.report import SessionReport
 
 
-def get_job_context() -> JobContext:
+@overload
+def get_job_context(*, required: Literal[True] = True) -> JobContext: ...
+
+
+@overload
+def get_job_context(*, required: Literal[False]) -> JobContext | None: ...
+
+
+def get_job_context(*, required: bool = True) -> JobContext | None:
     ctx = _JobContextVar.get(None)
-    if ctx is None:
+    if ctx is None and required:
         raise RuntimeError(
             "no job context found, are you running this code inside a job entrypoint?"
         )
@@ -64,6 +109,21 @@ def get_job_context() -> JobContext:
 
 
 get_current_job_context = get_job_context
+
+
+def current_simulation() -> SimulationContext | None:
+    """The :class:`SimulationContext` of the job running on this task, or ``None``.
+
+    ``None`` covers everything that is not a simulation: a production job, and code
+    running outside a job context at all (console mode, tests). Unlike
+    :meth:`JobContext.simulation_context` this does not need the job context in hand,
+    so it can be called from deep inside the stack.
+    """
+    ctx = get_job_context(required=False)
+    if ctx is None:
+        return None
+
+    return ctx.simulation_context()
 
 
 @unique
@@ -95,9 +155,19 @@ class RunningJobInfo:
     token: str
     worker_id: str
     fake_job: bool
+    # dispatch timeline, unix seconds; 0.0 when unknown (simulation, console, resumed jobs)
+    received_at: float = 0.0
+    """The worker received the availability request."""
+    accepted_at: float = 0.0
+    """The request handler accepted the job."""
+    assigned_at: float = 0.0
+    """The server's assignment (room token) arrived."""
+    launched_at: float = 0.0
+    """A process was acquired from the pool and handed the job."""
 
 
 DEFAULT_PARTICIPANT_KINDS: list[rtc.ParticipantKind.ValueType] = [
+    rtc.ParticipantKind.PARTICIPANT_KIND_CONNECTOR,
     rtc.ParticipantKind.PARTICIPANT_KIND_SIP,
     rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD,
 ]
@@ -170,6 +240,13 @@ class JobContext:
 
         self._primary_agent_session: AgentSession | None = None
 
+        # Lazily built from the job's simulation attributes; None when not under a
+        # simulation. _simulation_resolved guards the one-time parse.
+        self._simulation_ctx: SimulationContext | None = None
+        self._simulation_resolved = False
+        # on_simulation_end callback, injected by the job runner from AgentServer.
+        self._simulation_end_fnc: Callable[[SimulationContext], Any] | None = None
+
         self._tempdir = tempfile.TemporaryDirectory()
 
         from .cli import AgentsConsole
@@ -182,6 +259,15 @@ class JobContext:
 
         self._connected = False
         self._lock = asyncio.Lock()
+        self._tagger = Tagger()
+        self._recording_initialized = False
+        self._redaction_enabled = info.job.enable_redaction
+        self._early_log_handler: _BufferingHandler | None = None
+        # this job's cloud-telemetry registration, set by init_recording():
+        # span/log/metric attribution and upload gating resolve from it (the
+        # OTel providers are shared across possibly-concurrent jobs). None while
+        # the job has no registration to release.
+        self._telemetry_state: _JobTelemetry | None = None
 
     def _on_setup(self) -> None:
         root_logger = logging.getLogger()
@@ -189,13 +275,77 @@ class JobContext:
             handler.addFilter(self._log_filter)
             self._handlers_with_filter.append(handler)
 
+    def _start_log_buffering(self) -> None:
+        """Start buffering logs early so crash logs can be uploaded."""
+        if self._info.fake_job or not self._info.job.enable_recording:
+            return
+        if not _observability_url(self._info.url):
+            return
+
+        self._early_log_handler = _BufferingHandler()
+        logging.getLogger().addHandler(self._early_log_handler)
+
+    def _prepare_telemetry(self) -> None:
+        """Have the cloud trace pipeline up before the job's first span; whether anything is
+        uploaded is decided in ``init_recording``, and the job's spans are held until then."""
+        if self._info.fake_job:
+            return
+        obs_url = _observability_url(self._info.url)
+        if not obs_url:
+            return
+        try:
+            _prepare_cloud_tracer(
+                room_id=self.job.room.sid,
+                job_id=self.job.id,
+                agent_name=self.job.agent_name,
+                observability_url=obs_url,
+            )
+        except Exception:
+            logger.exception("failed to prepare the cloud trace pipeline")
+
+    def _stop_log_buffering(self) -> None:
+        """Remove the buffering handler without replaying."""
+        handler = self._early_log_handler
+        if handler is None:
+            return
+        logging.getLogger().removeHandler(handler)
+        self._early_log_handler = None
+
+    def _flush_early_log_buffer(self, *, replay: bool) -> None:
+        """Remove buffering handler and optionally replay records through OTLP."""
+        handler = self._early_log_handler
+        if handler is None:
+            return
+
+        logging.getLogger().removeHandler(handler)
+        self._early_log_handler = None
+
+        if not replay:
+            return
+
+        # replay through the framework's own OTLP handler that _setup_cloud_tracer
+        # just attached — the integrator may have their own OTel LoggingHandler on
+        # the root logger, and the buffered records must not be routed into it
+        otlp_handler = _cloud_log_handler()
+        if otlp_handler is not None and otlp_handler in logging.getLogger().handlers:
+            for record in handler.buffer:
+                otlp_handler.emit(record)
+
     async def _on_session_end(self) -> None:
         from .cli import AgentsConsole
 
         if not (session := self._primary_agent_session):
             return
 
+        otel_metrics.flush_turn_metrics(session.history)
+
         c = AgentsConsole.get_instance()
+
+        # in case AgentSession.aclose() was cancelled due to timeout
+        if (recorder_io := session._recorder_io) and recorder_io.recording:
+            logger.warning("recorder_io is still recording at session end, closing it")
+            await recorder_io.aclose()
+
         report = self.make_session_report(session)
 
         # console recording, dump data to a local file
@@ -215,23 +365,48 @@ class JobContext:
             except Exception:
                 logger.exception("failed to save session report")
 
-        if report.enable_recording:
+        has_evals = bool(self._tagger.evaluations or self._tagger.outcome)
+        obs_url = _observability_url(self._info.url)
+        if (recording_enabled(report.options.recording_options) or has_evals) and obs_url:
             try:
-                cloud_hostname = urlparse(self._info.url).hostname
-                if not cloud_hostname:
-                    raise ValueError(f"invalid cloud hostname: {self._info.url}")
                 await _upload_session_report(
                     agent_name=self._info.job.agent_name,
-                    cloud_hostname=cloud_hostname,
+                    observability_url=obs_url,
                     report=report,
+                    tagger=self._tagger,
                     http_session=http_context.http_session(),
+                    metadata=self._otel_metadata(
+                        report.options.recording_options,
+                        redaction_enabled=self._redaction_enabled,
+                    ),
                 )
             except Exception:
                 logger.exception("failed to upload the session report to LiveKit Cloud")
 
-    def _on_cleanup(self) -> None:
-        self._tempdir.cleanup()
-        _shutdown_telemetry()
+    async def _on_cleanup(self) -> None:
+        # if session.start() was never reached and server wanted recording,
+        # set up OTLP now and flush buffered crash logs
+        if self._early_log_handler is not None and not self._recording_initialized:
+            try:
+                from .voice.agent_session import RecordingOptions
+
+                self.init_recording(
+                    RecordingOptions(audio=False, traces=False, logs=True, transcript=False)
+                )
+            except Exception:
+                logger.exception("failed to initialize crash log upload")
+                self._stop_log_buffering()
+
+        def _cleanup_blocking() -> None:
+            self._tempdir.cleanup()
+            # per job: flushes this job's telemetry, leaves a concurrent job's untouched
+            if self._telemetry_state is not None:
+                _shutdown_telemetry(self.job.id)
+            # a job that never registered still had spans held for it by the gate
+            _discard_cloud_tracer(self.job.id)
+
+        # exporter flushes and the tempdir cleanup block; keep them off the event loop
+        await asyncio.to_thread(_cleanup_blocking)
 
         for handler in self._handlers_with_filter:
             handler.removeFilter(self._log_filter)
@@ -247,6 +422,21 @@ class JobContext:
     @property
     def inference_executor(self) -> InferenceExecutor:
         return self._inf_executor
+
+    @property
+    def tagger(self) -> Tagger:
+        """Returns the Tagger for adding tags and outcomes to the session.
+
+        Tags are uploaded to LiveKit Cloud at session end.
+
+        Example:
+            ```python
+            ctx.tagger.success(reason="Task completed successfully")
+            ctx.tagger.fail(reason="User hung up before completing")
+            ctx.tagger.add("voicemail:true")
+            ```
+        """
+        return self._tagger
 
     def make_session_report(self, session: AgentSession | None = None) -> SessionReport:
         from .voice.report import SessionReport
@@ -264,7 +454,6 @@ class JobContext:
             )
 
         sr = SessionReport(
-            enable_recording=session._enable_recording,
             job_id=self.job.id,
             room_id=self.job.room.sid,
             room=self.job.room.name,
@@ -274,6 +463,7 @@ class JobContext:
             started_at=session._started_at,
             events=session._recorded_events,
             chat_history=session.history.copy(),
+            model_usage=session.usage.model_usage,
         )
 
         if recorder_io:
@@ -282,6 +472,7 @@ class JobContext:
             if recorder_io.recording_started_at:
                 sr.audio_recording_started_at = recorder_io.recording_started_at
                 sr.duration = sr.timestamp - sr.audio_recording_started_at
+
         return sr
 
     @functools.cached_property
@@ -322,6 +513,79 @@ class JobContext:
     @property
     def agent(self) -> rtc.LocalParticipant:
         return self._room.local_participant
+
+    @property
+    def primary_session(self) -> AgentSession:
+        """Returns the primary AgentSession for this job."""
+        if not self._primary_agent_session:
+            raise RuntimeError("No AgentSession was started for this job")
+        return self._primary_agent_session
+
+    def simulation_context(self) -> SimulationContext | None:
+        """Return the :class:`SimulationContext` when this job is running under a
+        simulation, or ``None`` for a normal/production session.
+
+        Resolved once and cached. The framework hands it to ``on_simulation_end``
+        automatically, so you never need to call this to "prime" anything. Call it only
+        when you want the scenario in your entrypoint (e.g. to seed scenario-specific
+        mocks). Resolves synchronously from the job's ``lk.simulator.dispatch``
+        attribute (a protojson ``SimulationDispatch``), available as soon as the
+        entrypoint runs; a production job has none and returns ``None``.
+        """
+        if self._simulation_resolved:
+            return self._simulation_ctx
+
+        # The simulation attributes ride the agent dispatch and land on the job
+        # itself, so this is final before the room even connects.
+        self._simulation_resolved = True
+
+        metadata = self._info.job.attributes.get(ATTRIBUTE_SIMULATOR_DISPATCH, "")
+        if not metadata:
+            return None
+
+        from google.protobuf import json_format
+
+        from livekit.protocol import agent_simulation as sim_pb
+
+        from .simulation import SimulationContext
+
+        try:
+            # ignore unknown fields so dispatches from newer servers still parse
+            dispatch = json_format.Parse(
+                metadata, sim_pb.SimulationDispatch(), ignore_unknown_fields=True
+            )
+        except json_format.ParseError:
+            return None
+
+        if not dispatch.simulation_run_id:
+            return None
+
+        self._simulation_ctx = SimulationContext(dispatch, self)
+        return self._simulation_ctx
+
+    @property
+    def inference_headers(self) -> dict[str, str]:
+        """Extra headers this job puts on every LiveKit Inference request it makes.
+
+        Merged last by ``inference.get_inference_headers``, so what the job asserts
+        about itself outranks what an individual model was configured with. Empty for
+        an ordinary job.
+        """
+        from .inference._utils import HEADER_INFERENCE_PRIORITY
+        from .simulation import SimulationMode
+
+        headers: dict[str, str] = {}
+
+        # A text simulation is batch load: a run fans out many jobs at once and nobody
+        # is waiting on the answers, so it must not compete with live traffic for
+        # gateway capacity, and it must not be able to ask for priority either. Audio
+        # simulations are excluded: they run in real time against the audio pipeline,
+        # so their latency has to stay representative of production.
+        sim = self.simulation_context()
+        if sim is not None and sim.simulation_mode == SimulationMode.SIMULATION_MODE_TEXT:
+            headers[HEADER_INFERENCE_PRIORITY] = "low"
+
+        return headers
 
     @property
     def local_participant_identity(self) -> str:
@@ -372,6 +636,10 @@ class JobContext:
             async def wrapper(_: str) -> None:
                 await callback()  # type: ignore
 
+            # the job_shutdown trace labels callbacks by name and tells framework ones by module
+            wrapper.__name__ = getattr(callback, "__name__", wrapper.__name__)
+            wrapper.__qualname__ = getattr(callback, "__qualname__", wrapper.__qualname__)
+            wrapper.__module__ = getattr(callback, "__module__", wrapper.__module__)
             self._shutdown_callbacks.append(wrapper)
 
     async def wait_for_participant(
@@ -386,39 +654,101 @@ class JobContext:
         participant that joins the room will be returned.
         If the participant has already joined, the function will return immediately.
         """
-        return await wait_for_participant(self._room, identity=identity, kind=kind)
 
+        # handle connection automatically, otherwise wait_for_participant will raise an error
+        if not self._room.isconnected():
+            await self.connect()
+
+        # nests under session_start when the session is starting, else the ambient context
+        with session_context.session_span(
+            "wait_for_participant",
+            attributes={trace_types.ATTR_ROOM_IO_PARTICIPANT_FILTER: identity is not None},
+            job_ctx=self,
+        ) as span:
+            participant = await wait_for_participant(self._room, identity=identity, kind=kind)
+            span.set_attributes(telemetry_utils.participant_attributes(participant))
+            return participant
+
+    @deprecate_params({"e2ee": "Use `encryption` instead."})
     async def connect(
         self,
         *,
-        e2ee: rtc.E2EEOptions | None = None,
+        encryption: rtc.E2EEOptions | None = None,
         auto_subscribe: AutoSubscribe = AutoSubscribe.SUBSCRIBE_ALL,
         rtc_config: rtc.RtcConfiguration | None = None,
+        single_peer_connection: bool | None = None,
+        # deprecated
+        e2ee: rtc.E2EEOptions | None = None,
     ) -> None:
         """Connect to the room. This method should be called only once.
 
         Args:
-            e2ee: End-to-end encryption options. If provided, the Agent will utilize end-to-end encryption. Note: clients will also need to handle E2EE.
+            encryption: End-to-end encryption options. If provided, the Agent will utilize end-to-end encryption. Note: clients will also need to handle E2EE.
             auto_subscribe: Whether to automatically subscribe to tracks. Default is AutoSubscribe.SUBSCRIBE_ALL.
             rtc_config: Custom RTC configuration to use when connecting to the room.
+            single_peer_connection: Use a single peer connection for both publish and subscribe. When None, uses the default (False).
         """  # noqa: E501
         async with self._lock:
             if self._connected:
                 return
 
+            encryption = encryption or e2ee
             room_options = rtc.RoomOptions(
-                e2ee=e2ee,
+                encryption=encryption,
                 auto_subscribe=auto_subscribe == AutoSubscribe.SUBSCRIBE_ALL,
                 rtc_config=rtc_config,
+                single_peer_connection=single_peer_connection,
             )
 
-            await self._room.connect(self._info.url, self._info.token, options=room_options)
+            with session_context.session_span(
+                "room_connect",
+                attributes={
+                    trace_types.ATTR_ROOM_NAME: self._info.job.room.name,
+                    trace_types.ATTR_ROOM_SID: self._info.job.room.sid,
+                    trace_types.ATTR_ROOM_AUTO_SUBSCRIBE: AutoSubscribe(auto_subscribe).value,
+                    trace_types.ATTR_ROOM_E2EE: encryption is not None,
+                },
+                job_ctx=self,
+            ) as connect_span:
+                await self._room.connect(self._info.url, self._info.token, options=room_options)
+                connect_span.set_attributes(
+                    {
+                        trace_types.ATTR_PARTICIPANT_ID: self._room.local_participant.sid,
+                        trace_types.ATTR_PARTICIPANT_IDENTITY: self._room.local_participant.identity,  # noqa: E501
+                        trace_types.ATTR_ROOM_REMOTE_PARTICIPANT_COUNT: len(
+                            self._room.remote_participants
+                        ),
+                    }
+                )
+            rpc_tracing.install(self._room.local_participant)
             self._on_connect()
+
+            # Always registered: the callback ignores participants without the
+            # simulator attribute, and gating on simulation_context() here would
+            # race the participant-list sync.
+            self._room.on("participant_disconnected", self._on_simulator_disconnected)
+
             for p in self._room.remote_participants.values():
                 self._participant_available(p)
 
             _apply_auto_subscribe_opts(self._room, auto_subscribe)
             self._connected = True
+
+    def _track_pending_task(self, task: asyncio.Task[Any], *, name: str) -> None:
+        """Track a fire-and-forget task so its exceptions are surfaced instead of swallowed.
+
+        Callers may still await the returned task to handle errors themselves; this only
+        guarantees that an otherwise unhandled exception is logged rather than silently
+        dropped (e.g. when the returned future is not awaited).
+        """
+        self._pending_tasks.append(task)
+
+        def _on_done(task: asyncio.Task[Any]) -> None:
+            self._pending_tasks.remove(task)
+            if not task.cancelled() and (exc := task.exception()) is not None:
+                logger.error(f"error in {name}", exc_info=exc)
+
+        task.add_done_callback(_on_done)
 
     def delete_room(self, room_name: str | None = None) -> asyncio.Future[api.DeleteRoomResponse]:  # type: ignore
         """Deletes the room and disconnects all participants."""
@@ -442,8 +772,7 @@ class JobContext:
                 logger.exception("unknown error while deleting room")
 
         task = asyncio.create_task(_delete_room())
-        self._pending_tasks.append(task)
-        task.add_done_callback(lambda _: self._pending_tasks.remove(task))
+        self._track_pending_task(task, name="delete_room")
         return task
 
     def add_sip_participant(
@@ -485,8 +814,7 @@ class JobContext:
                 )
             ),
         )
-        self._pending_tasks.append(task)
-        task.add_done_callback(lambda _: self._pending_tasks.remove(task))
+        self._track_pending_task(task, name="add_sip_participant")
         return task
 
     def transfer_sip_participant(
@@ -537,11 +865,10 @@ class JobContext:
                 )
             ),
         )
-        self._pending_tasks.append(task)
-        task.add_done_callback(lambda _: self._pending_tasks.remove(task))
+        self._track_pending_task(task, name="transfer_sip_participant")
         return task
 
-    def shutdown(self, reason: str = "") -> None:
+    def shutdown(self, reason: str = "user requested") -> None:
         self._on_shutdown(reason)
 
     def add_participant_entrypoint(
@@ -561,18 +888,51 @@ class JobContext:
 
         self._participant_entrypoints.append((entrypoint_fnc, kind))
 
-    def init_recording(self) -> None:
-        if not is_cloud(self._info.url):
+    def init_recording(self, options: RecordingOptions) -> None:
+        redaction_enabled = self.job.enable_redaction or options.get("redaction", False)
+        if redaction_enabled and options.get("audio", True) and not options.get("transcript", True):
+            raise ValueError("audio upload requires transcript upload when redaction is enabled")
+
+        if self._recording_initialized:
+            self._stop_log_buffering()
             return
 
-        cloud_hostname = urlparse(self._info.url).hostname
-        logger.debug("configuring session recording", extra={"hostname": cloud_hostname})
-        if cloud_hostname:
-            _setup_cloud_tracer(
-                room_id=self.job.room.sid,
-                job_id=self.job.id,
-                cloud_hostname=cloud_hostname,
-            )
+        self._recording_initialized = True
+        self._redaction_enabled = redaction_enabled
+
+        needs_cloud = (
+            options.get("traces", True)
+            or options.get("logs", True)
+            or options.get("audio", True)
+            or options.get("transcript", True)
+        )
+        obs_url = _observability_url(self._info.url)
+        if not (needs_cloud and obs_url):
+            self._stop_log_buffering()
+            return
+
+        logger.debug("configuring session recording")
+        self._telemetry_state = _setup_cloud_tracer(
+            room_id=self.job.room.sid,
+            job_id=self.job.id,
+            agent_name=self.job.agent_name,
+            observability_url=obs_url,
+            enable_traces=options["traces"],
+            enable_logs=options["logs"],
+            metadata=self._otel_metadata(options, redaction_enabled=redaction_enabled),
+        )
+        # init_recording is typically called during session.start(), at which point a bunch of
+        # the logs would have already been emitted. we want to capture all of the logs as it
+        # relates to the job
+        self._flush_early_log_buffer(replay=options["logs"])
+
+    def _on_simulator_disconnected(self, p: rtc.RemoteParticipant) -> None:
+        # the agent under test may add other participants (SIP legs, avatar workers)
+        if ATTRIBUTE_SIMULATOR not in p.attributes:
+            return
+
+        logger.debug("simulator disconnected, shutting down the job")
+        self.shutdown(reason="simulation completed")
 
     def _participant_available(self, p: rtc.RemoteParticipant) -> None:
         for coro, kind in self._participant_entrypoints:
@@ -590,12 +950,41 @@ class JobContext:
             task_name = f"part-entry-{p.identity}-{coro.__name__}"
             task = asyncio.create_task(coro(self, p), name=task_name)
             self._participant_tasks[(p.identity, coro)] = task
-            task.add_done_callback(
-                lambda _, coro=coro: self._participant_tasks.pop((p.identity, coro))  # type: ignore
-            )
+
+            def _on_done(task: asyncio.Task[Any], *, coro: Any = coro) -> None:
+                key = (p.identity, coro)
+                if self._participant_tasks.get(key) is task:
+                    self._participant_tasks.pop(key, None)
+                if not task.cancelled() and (exc := task.exception()) is not None:
+                    logger.error(
+                        f"error in participant entrypoint {coro.__name__} for '{p.identity}'",
+                        exc_info=exc,
+                    )
+
+            task.add_done_callback(_on_done)
 
     def token_claims(self) -> Claims:
         return api.TokenVerifier().verify(self._info.token, verify_signature=False)
+
+    def _otel_metadata(
+        self, options: RecordingOptions | None = None, *, redaction_enabled: bool = False
+    ) -> dict[str, Any] | None:
+        metadata: dict[str, Any] = {}
+        if (sim := self.simulation_context()) is not None:
+            metadata[ATTRIBUTE_SIMULATION_ENABLED] = True
+            # The run/job ids ride every span and log so a run can be aggregated as a
+            # whole. Omitted when blank rather than sent empty: an absent attribute
+            # reads as "not a simulation" downstream, an empty one as a run named "".
+            if sim.simulation_run_id:
+                metadata[ATTRIBUTE_SIMULATION_RUN_ID] = sim.simulation_run_id
+            if sim.simulation_job_id:
+                metadata[ATTRIBUTE_SIMULATION_JOB_ID] = sim.simulation_job_id
+        # stamped on every span and log so redaction can be resolved per-record, off the
+        # record itself, rather than from the ambient job context. Takes the resolved
+        # flag so project-wide redaction counts, not just the per-session option.
+        if redaction_enabled or (options and options.get("redaction", False)):
+            metadata[ATTRIBUTE_REDACTION_ENABLED] = True
+        return metadata or None
 
 
 def _apply_auto_subscribe_opts(room: rtc.Room, auto_subscribe: AutoSubscribe) -> None:
@@ -715,122 +1104,3 @@ class JobRequest:
 class _JobShutdownInfo:
     user_initiated: bool
     reason: str
-
-
-async def run_job(
-    job_entrypoint_fnc: Callable[[JobContext], Any],
-    *,
-    info: RunningJobInfo,
-    room: rtc.Room | None = None,
-    executor_type: JobExecutorType = JobExecutorType.THREAD,
-    user_arguments: Any | None = None,
-    http_proxy: str | None = None,
-    inference_executor: InferenceExecutor,
-) -> None:
-    is_fake_room = False
-    if not room:
-        from .ipc.mock_room import create_mock_room
-
-        is_fake_room = True
-        room = cast(rtc.Room, create_mock_room())
-
-    room._info.name = info.job.room.name
-    shutdown_fut: asyncio.Future[_JobShutdownInfo] = asyncio.Future()
-
-    ctx_connect_called = False
-    ctx_shutdown_called = False
-
-    @room.on("disconnected")
-    def _on_room_disconnected(*args: Any) -> None:
-        with contextlib.suppress(asyncio.InvalidStateError):
-            shutdown_fut.set_result(
-                _JobShutdownInfo(user_initiated=False, reason="room disconnected")
-            )
-
-    def _on_ctx_connect() -> None:
-        nonlocal ctx_connect_called
-        ctx_connect_called = True
-
-    def _on_ctx_shutdown(reason: str) -> None:
-        nonlocal ctx_shutdown_called
-        ctx_shutdown_called = True
-
-        with contextlib.suppress(asyncio.InvalidStateError):
-            shutdown_fut.set_result(_JobShutdownInfo(user_initiated=True, reason=reason))
-
-    proc = JobProcess(
-        executor_type=executor_type, user_arguments=user_arguments, http_proxy=http_proxy
-    )
-    job_ctx = JobContext(
-        proc=proc,
-        info=info,
-        room=room,
-        inference_executor=inference_executor,
-        on_connect=_on_ctx_connect,
-        on_shutdown=_on_ctx_shutdown,
-    )
-
-    job_ctx_token = _JobContextVar.set(job_ctx)
-    http_context._new_session_ctx()
-
-    @tracer.start_as_current_span("job_entrypoint")
-    async def _traceable_entrypoint(job_ctx: JobContext) -> None:
-        job = job_ctx.job
-        current_span = trace.get_current_span()
-        current_span.set_attribute(trace_types.ATTR_JOB_ID, job.id)
-        current_span.set_attribute(trace_types.ATTR_AGENT_NAME, job.agent_name)
-        current_span.set_attribute(trace_types.ATTR_ROOM_NAME, job.room.name)
-        await job_entrypoint_fnc(job_ctx)
-
-    job_task = asyncio.create_task(_traceable_entrypoint(job_ctx), name="job_user_entrypoint")
-
-    async def _warn_not_connected_task() -> None:
-        await asyncio.sleep(10)
-        if not ctx_connect_called and not ctx_shutdown_called:
-            logger.warning(
-                "The room connection was not established within 10 seconds after calling job_entry. "  # noqa: E501
-                "This may indicate that job_ctx.connect() was not called. "
-            )
-
-    if not is_fake_room:
-        warn_unconnected_task = asyncio.create_task(_warn_not_connected_task())
-        job_task.add_done_callback(lambda _: warn_unconnected_task.cancel())
-
-    def log_exception(t: asyncio.Task[Any]) -> None:
-        if not t.cancelled() and t.exception():
-            logger.error(
-                "unhandled exception while running the job task",
-                exc_info=t.exception(),
-            )
-        elif not ctx_connect_called and not ctx_shutdown_called:
-            if is_fake_room:
-                return
-
-            logger.warning(
-                "The job task completed without establishing a connection or performing a proper shutdown. "  # noqa: E501
-                "Ensure that job_ctx.connect()/job_ctx.shutdown() is called and the job is correctly finalized."  # noqa: E501
-            )
-
-    job_task.add_done_callback(log_exception)
-
-    shutdown_info = await shutdown_fut
-    logger.debug(
-        "shutting down job task",
-        extra={"reason": shutdown_info.reason, "user_initiated": shutdown_info.user_initiated},
-    )
-
-    await room.disconnect()
-
-    try:
-        shutdown_tasks = []
-        for callback in job_ctx._shutdown_callbacks:
-            shutdown_tasks.append(
-                asyncio.create_task(callback(shutdown_info.reason), name="job_shutdown_callback")
-            )
-
-        await asyncio.gather(*shutdown_tasks)
-    except Exception:
-        logger.exception("error while shutting down the job")
-
-    await http_context._close_http_ctx()
-    _JobContextVar.reset(job_ctx_token)

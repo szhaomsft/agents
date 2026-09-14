@@ -1,7 +1,6 @@
 import os
 import time
 from abc import ABC, abstractmethod
-from typing import Optional
 
 import psutil
 
@@ -22,12 +21,12 @@ class CPUMonitor(ABC):
         pass
 
 
-def _cpu_count_from_env() -> Optional[float]:
+def _cpu_count_from_env() -> float | None:
     try:
         if "NUM_CPUS" in os.environ:
             return float(os.environ["NUM_CPUS"])
-    except ValueError:
-        logger.warning("Failed to parse NUM_CPUS from environment", exc_info=True)
+    except ValueError as e:
+        logger.warning("failed to parse NUM_CPUS from environment: %s", e)
     return None
 
 
@@ -40,6 +39,9 @@ class DefaultCPUMonitor(CPUMonitor):
 
 
 class CGroupV2CPUMonitor(CPUMonitor):
+    def __init__(self) -> None:
+        self._last_cpu_percent = 0.0
+
     def cpu_count(self) -> float:
         # quota: The maximum CPU time in microseconds that the cgroup can use within a given period.
         # period: The period of time in microseconds over which the quota applies.
@@ -54,26 +56,36 @@ class CGroupV2CPUMonitor(CPUMonitor):
         return 1.0 * int(quota) / period
 
     def cpu_percent(self, interval: float = 0.5) -> float:
+        start = time.monotonic()
         cpu_usage_start = self._read_cpu_usage()
         time.sleep(interval)
         cpu_usage_end = self._read_cpu_usage()
-        cpu_usage_diff = cpu_usage_end - cpu_usage_start
+        elapsed = time.monotonic() - start
 
         # microseconds to seconds
-        cpu_usage_seconds = cpu_usage_diff / 1_000_000
+        cpu_usage_seconds = (cpu_usage_end - cpu_usage_start) / 1_000_000
 
-        num_cpus = self.cpu_count()
-        cpu_usage_percent = cpu_usage_seconds / (interval * num_cpus)
+        # some hypervisors serve a torn per-cpu sum, so discard a delta the host cannot have produced
+        max_cpu_usage_seconds = elapsed * (psutil.cpu_count() or 1)
+        if not 0 <= cpu_usage_seconds <= max_cpu_usage_seconds:
+            logger.warning(
+                "discarding impossible cgroup cpu usage delta of %.3fs (ceiling %.3fs)",
+                cpu_usage_seconds,
+                max_cpu_usage_seconds,
+            )
+            return self._last_cpu_percent
 
-        return min(cpu_usage_percent, 1)
+        cpu_usage_percent = cpu_usage_seconds / (elapsed * self.cpu_count())
+        self._last_cpu_percent = min(cpu_usage_percent, 1.0)
+        return self._last_cpu_percent
 
     def _read_cpu_max(self) -> tuple[str, int]:
         try:
             with open("/sys/fs/cgroup/cpu.max") as f:
                 data = f.read().strip().split()
             quota = data[0]
-            period = int(data[1])
-        except FileNotFoundError:
+            period = int(data[1]) if len(data) > 1 else 100000
+        except (FileNotFoundError, IndexError, ValueError):
             quota = "max"
             period = 100000
         return quota, period
@@ -111,7 +123,7 @@ class CGroupV1CPUMonitor(CPUMonitor):
         percent = usage_seconds / (interval * num_cpus)
         return max(min(percent, 1.0), 0.0)
 
-    def _read_cfs_quota_and_period(self) -> tuple[Optional[int], Optional[int]]:
+    def _read_cfs_quota_and_period(self) -> tuple[int | None, int | None]:
         quota_path_candidates = [
             "/sys/fs/cgroup/cpu/cpu.cfs_quota_us",
         ]
@@ -131,7 +143,7 @@ class CGroupV1CPUMonitor(CPUMonitor):
             raise RuntimeError("Failed to read cpuacct.usage for cgroup v1")
         return value
 
-    def _read_first_int(self, paths: list[str]) -> Optional[int]:
+    def _read_first_int(self, paths: list[str]) -> int | None:
         for p in paths:
             try:
                 with open(p) as f:

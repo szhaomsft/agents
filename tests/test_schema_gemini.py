@@ -1,11 +1,12 @@
 import datetime
-from typing import Optional
 
 import pytest
 from google.genai import types
 from pydantic import BaseModel, Field
 
 from livekit.plugins.google import utils
+
+pytestmark = [pytest.mark.unit, pytest.mark.concurrent]
 
 #  Gemini Schema Tests
 
@@ -75,7 +76,7 @@ async def test_json_def_replaced_any_of():
         lng: float
 
     class Locations(BaseModel):
-        op_location: Optional[Location] = None
+        op_location: Location | None = None
 
     json_schema = Locations.model_json_schema()
 

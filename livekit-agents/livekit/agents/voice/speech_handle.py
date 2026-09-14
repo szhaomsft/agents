@@ -2,15 +2,32 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import Generator, Sequence
-from typing import Any, Callable
+import time
+from collections.abc import Callable, Generator, Sequence
+from dataclasses import dataclass
+from typing import Any, Literal
 
-from opentelemetry import context as otel_context
+from opentelemetry import context as otel_context, trace
 
 from .. import llm, utils
 from ..log import logger
+from ..telemetry import trace_types
 
 INTERRUPTION_TIMEOUT = 5.0  # seconds
+
+
+@dataclass
+class InputDetails:
+    modality: Literal["text", "audio"]
+
+
+DEFAULT_INPUT_DETAILS = InputDetails(modality="audio")
+
+
+InterruptionSource = Literal["audio_activity", "user_turn", "programmatic"]
+"""Why a speech was interrupted, for the ``agent_turn`` trace: the user started talking over
+it (``audio_activity``), a committed user turn preempted it (``user_turn``), or code did
+(``programmatic``: ``session.interrupt()``, a tool, teardown)."""
 
 
 class SpeechHandle:
@@ -21,9 +38,14 @@ class SpeechHandle:
     SPEECH_PRIORITY_HIGH = 10
     """Priority for important messages that should be played before others."""
 
-    def __init__(self, *, speech_id: str, allow_interruptions: bool) -> None:
+    def __init__(
+        self, *, speech_id: str, allow_interruptions: bool, input_details: InputDetails
+    ) -> None:
         self._id = speech_id
         self._allow_interruptions = allow_interruptions
+        self._interruption_holds = 0
+        self._interruption_holds_restore = allow_interruptions
+        self._input_details = input_details
 
         self._interrupt_fut = asyncio.Future[None]()
         self._done_fut = asyncio.Future[None]()
@@ -36,7 +58,15 @@ class SpeechHandle:
         self._tasks: list[asyncio.Task] = []
         self._chat_items: list[llm.ChatItem] = []
         self._num_steps = 1
+        # one agent_turn span for the whole speech, however many generations (LLM steps) it
+        # takes; opened by the first reply task, ended with the speech in _mark_done
+        self._agent_turn_span: trace.Span | None = None
         self._agent_turn_context: otel_context.Context | None = None
+        self._agent_turn_started_at: float | None = None
+        self._agent_turn_agent_name: str | None = None
+        self._scheduled_at: float | None = None
+        self._authorized_at: float | None = None
+        self._interrupt_source: InterruptionSource | None = None  # first interrupt's cause
 
         self._interrupt_timeout_handle: asyncio.TimerHandle | None = None
 
@@ -44,17 +74,25 @@ class SpeechHandle:
         self._done_callbacks: set[Callable[[SpeechHandle], None]] = set()
 
         def _on_done(_: asyncio.Future[None]) -> None:
-            for cb in self._done_callbacks:
-                cb(self)
+            for cb in list(self._done_callbacks):
+                try:
+                    cb(self)
+                except Exception as e:
+                    logger.warning(f"error in done_callback: {cb}", exc_info=e)
 
         self._done_fut.add_done_callback(_on_done)
         self._maybe_run_final_output: Any = None  # kept private
+        self._error: BaseException | None = None
 
     @staticmethod
-    def create(allow_interruptions: bool = True) -> SpeechHandle:
+    def create(
+        allow_interruptions: bool = True,
+        input_details: InputDetails = DEFAULT_INPUT_DETAILS,
+    ) -> SpeechHandle:
         return SpeechHandle(
             speech_id=utils.shortuuid("speech_"),
             allow_interruptions=allow_interruptions,
+            input_details=input_details,
         )
 
     @property
@@ -64,6 +102,10 @@ class SpeechHandle:
     @property
     def id(self) -> str:
         return self._id
+
+    @property
+    def input_details(self) -> InputDetails:
+        return self._input_details
 
     @property
     def _generation_id(self) -> str:
@@ -108,6 +150,29 @@ class SpeechHandle:
 
         self._allow_interruptions = value
 
+    def _hold_interruptions(self) -> None:
+        """Disallow interruptions until every hold taken here is released.
+
+        Counted rather than set, because the holders of one speech are not serialised
+        against each other: the inline tasks awaited from a turn's parallel tool calls run
+        one at a time, and a hold released between them would let the user turns of one
+        task's sub-conversation interrupt the speech the rest are still anchored to. An
+        interrupted handle can no longer disallow interruptions, so those tasks could then
+        never run. The first holder owns the value the last one restores.
+        """
+        if self._interruption_holds == 0:
+            self._interruption_holds_restore = self._allow_interruptions
+            self.allow_interruptions = False
+
+        self._interruption_holds += 1
+
+    def _release_interruptions(self) -> None:
+        self._interruption_holds -= 1
+        if self._interruption_holds == 0:
+            # a forced interrupt lands regardless of the hold, and leaves nothing to restore
+            with contextlib.suppress(RuntimeError):
+                self.allow_interruptions = self._interruption_holds_restore
+
     @property
     def chat_items(self) -> list[llm.ChatItem]:
         return self._chat_items
@@ -115,18 +180,49 @@ class SpeechHandle:
     def done(self) -> bool:
         return self._done_fut.done()
 
-    def interrupt(self, *, force: bool = False) -> SpeechHandle:
-        """Interrupt the current speech generation.
+    def exception(self) -> BaseException | None:
+        """Return the error that caused this speech to fail, if any.
+
+        Awaiting a SpeechHandle never raises; call this method after the handle
+        is done to check whether the generation failed (e.g. ``llm.RealtimeError``
+        when a realtime reply timed out).
 
         Raises:
-            RuntimeError: If this speech handle does not allow interruptions.
+            asyncio.InvalidStateError: If the speech is not done yet.
+
+        Returns:
+            BaseException | None: The error the generation failed with, or None.
+        """
+        if not self._done_fut.done():
+            raise asyncio.InvalidStateError("SpeechHandle is not done yet")
+
+        return self._error
+
+    def interrupt(
+        self, *, force: bool = False, source: InterruptionSource = "programmatic"
+    ) -> SpeechHandle:
+        """Interrupt the current speech generation.
+
+        Args:
+            force: Interrupt even if this speech disallows interruptions.
+            source: Why, for the ``agent_turn`` trace (see ``InterruptionSource``). The first
+                interruption's cause is the one recorded.
+
+        Raises:
+            RuntimeError: If this speech handle is still running and does not allow
+                interruptions.
 
         Returns:
             SpeechHandle: The same speech handle that was interrupted.
         """
+        if self.interrupted or self.done():
+            # already cancelled or finished: nothing to interrupt, and protection is moot
+            return self
+
         if not force and not self._allow_interruptions:
             raise RuntimeError("This generation handle does not allow interruptions")
 
+        self._interrupt_source = source  # first interrupt only: later calls return above
         self._cancel()
         return self
 
@@ -143,7 +239,12 @@ class SpeechHandle:
 
         if task := asyncio.current_task():
             info = _get_activity_task_info(task)
-            if info and info.function_call and info.speech_handle == self:
+            if (
+                info
+                and info.function_call
+                and info.speech_handle == self
+                and not info.function_call.extra.get("__livekit_agents_tool_non_blocking", False)
+            ):
                 raise RuntimeError(
                     f"cannot call `SpeechHandle.wait_for_playout()` from inside the function tool `{info.function_call.name}` that owns this SpeechHandle. "
                     "This creates a circular wait: the speech handle is waiting for the function tool to complete, "
@@ -161,6 +262,10 @@ class SpeechHandle:
         return _await_impl().__await__()
 
     def add_done_callback(self, callback: Callable[[SpeechHandle], None]) -> None:
+        if self.done():
+            asyncio.get_running_loop().call_soon(callback, self)
+            return
+
         self._done_callbacks.add(callback)
 
     def remove_done_callback(self, callback: Callable[[SpeechHandle], None]) -> None:
@@ -206,14 +311,19 @@ class SpeechHandle:
 
     def _item_added(self, items: Sequence[llm.ChatItem]) -> None:
         for item in items:
-            for cb in self._item_added_callbacks:
-                cb(item)
+            for cb in list(self._item_added_callbacks):
+                try:
+                    cb(item)
+                except Exception as e:
+                    logger.warning(f"error in item_added_callback: {cb}", exc_info=e)
 
             self._chat_items.append(item)
 
     def _authorize_generation(self) -> None:
         fut = asyncio.Future[None]()
         self._generations.append(fut)
+        if self._authorized_at is None:
+            self._authorized_at = time.perf_counter()
         self._authorize_event.set()
 
     def _clear_authorization(self) -> None:
@@ -238,17 +348,81 @@ class SpeechHandle:
         with contextlib.suppress(asyncio.InvalidStateError):
             self._generations[-1].set_result(None)
 
-    def _mark_done(self) -> None:
-        with contextlib.suppress(asyncio.InvalidStateError):
-            # will raise InvalidStateError if the future is already done (interrupted)
+    def _mark_done(self, error: BaseException | None = None) -> None:
+        # the error is kept out of _done_fut so awaiting the handle never raises
+        # (most handles are never awaited); it is exposed via exception() instead
+        if not self._done_fut.done():
+            if error is not None:
+                self._error = error
             self._done_fut.set_result(None)
-            if self._generations:
-                self._mark_generation_done()  # preemptive generation could be cancelled before being scheduled
+        # a pipeline LLM failure is stored on the handle before the tasks finish
+        self._end_agent_turn(error if error is not None else self._error)
+
+        if self._generations:
+            self._mark_generation_done()
 
         if self._interrupt_timeout_handle is not None:
             self._interrupt_timeout_handle.cancel()
             self._interrupt_timeout_handle = None
 
+    def _take_agent_turn(self) -> tuple[trace.Span, float | None, str | None] | None:
+        """Detach this speech's open ``agent_turn`` so a successor can continue it.
+
+        Used when a preemptive generation is discarded for another speech answering the same
+        user turn: the wasted generation stays visible under the one turn instead of becoming
+        a turn of its own. After this the speech ends without touching the span."""
+        span = self._agent_turn_span
+        if span is None:
+            return None
+        carry = (span, self._agent_turn_started_at, self._agent_turn_agent_name)
+        self._agent_turn_span = None
+        self._agent_turn_context = None
+        self._agent_turn_started_at = None
+        self._agent_turn_agent_name = None
+        return carry
+
+    def _continue_agent_turn(
+        self, carry: tuple[trace.Span, float | None, str | None], *, discarded: SpeechHandle
+    ) -> None:
+        """Adopt the ``agent_turn`` taken from ``discarded`` (see ``_take_agent_turn``)."""
+        # adopted even when sampled out: the duration metric still needs the start time
+        span, started_at, agent_name = carry
+        span.add_event(
+            "preemptive_generation_discarded", {trace_types.ATTR_SPEECH_ID: discarded.id}
+        )
+        span.set_attribute(trace_types.ATTR_SPEECH_ID, self.id)
+        self._agent_turn_span = span
+        self._agent_turn_context = trace.set_span_in_context(span)
+        self._agent_turn_started_at = started_at
+        self._agent_turn_agent_name = agent_name
+
+    def _end_agent_turn(self, error: BaseException | None) -> None:
+        """Close the speech's ``agent_turn`` span: the speech is done, whatever step it was on."""
+        span, self._agent_turn_span = self._agent_turn_span, None
+        if span is None:
+            return
+        from ..telemetry import otel_metrics, utils as trace_utils
+
+        # the duration metric does not depend on the span being sampled in
+        if self._agent_turn_started_at is not None and self._agent_turn_agent_name is not None:
+            otel_metrics.record_invoke_agent_duration(
+                time.perf_counter() - self._agent_turn_started_at,
+                agent_name=self._agent_turn_agent_name,
+            )
+        if not span.is_recording():
+            return
+        if isinstance(error, Exception):
+            trace_utils.record_exception(span, error)
+        span.end()
+
     def _mark_scheduled(self) -> None:
+        if self._scheduled_at is None:
+            self._scheduled_at = time.perf_counter()
         with contextlib.suppress(asyncio.InvalidStateError):
             self._scheduled_fut.set_result(None)
+
+    def _queue_wait(self) -> float | None:
+        """Seconds between scheduling and the first generation authorization, once known."""
+        if self._scheduled_at is None or self._authorized_at is None:
+            return None
+        return max(self._authorized_at - self._scheduled_at, 0.0)

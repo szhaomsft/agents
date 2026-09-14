@@ -7,7 +7,11 @@ from typing import Any
 
 from livekit.agents import llm
 
-from .utils import group_tool_calls
+from .utils import (
+    convert_mid_conversation_instructions,
+    group_tool_calls,
+    parse_tool_call_arguments,
+)
 
 
 @dataclass
@@ -16,8 +20,13 @@ class AnthropicFormatData:
 
 
 def to_chat_ctx(
-    chat_ctx: llm.ChatContext, *, inject_dummy_user_message: bool = True
+    chat_ctx: llm.ChatContext,
+    *,
+    inject_dummy_user_message: bool = True,
+    inject_trailing_user_message: bool = False,
 ) -> tuple[list[dict], AnthropicFormatData]:
+    chat_ctx = convert_mid_conversation_instructions(chat_ctx)
+
     messages: list[dict[str, Any]] = []
     system_messages: list[str] = []
     current_role: str | None = None
@@ -28,7 +37,7 @@ def to_chat_ctx(
         chat_items.extend(group.flatten())
 
     for msg in chat_items:
-        if msg.type == "message" and msg.role == "system" and (text := msg.text_content):
+        if msg.type == "message" and msg.role == "system" and (text := msg.raw_text_content):
             system_messages.append(text)
             continue
 
@@ -47,25 +56,35 @@ def to_chat_ctx(
 
         if msg.type == "message":
             for c in msg.content:
-                if c and isinstance(c, str):
-                    content.append({"text": c, "type": "text"})
-                elif isinstance(c, llm.ImageContent):
+                if isinstance(c, llm.ImageContent):
                     content.append(_to_image_content(c))
+                elif isinstance(c, llm.AudioContent):
+                    pass
+                elif c:
+                    # str or Instructions
+                    content.append({"text": str(c), "type": "text"})
         elif msg.type == "function_call":
             content.append(
                 {
                     "id": msg.call_id,
                     "type": "tool_use",
                     "name": msg.name,
-                    "input": json.loads(msg.arguments or "{}"),
+                    "input": parse_tool_call_arguments(msg),
                 }
             )
         elif msg.type == "function_call_output":
+            result_content: list[Any] | str = msg.output
+            try:
+                parsed = json.loads(msg.output)
+                if isinstance(parsed, list):
+                    result_content = parsed
+            except (json.JSONDecodeError, TypeError):
+                pass
             content.append(
                 {
                     "tool_use_id": msg.call_id,
                     "type": "tool_result",
-                    "content": msg.output,
+                    "content": result_content,
                     "is_error": msg.is_error,
                 }
             )
@@ -82,6 +101,11 @@ def to_chat_ctx(
                 "content": [{"text": "(empty)", "type": "text"}],
             },
         )
+
+    # Claude 4.6+ does not support prefilling (trailing assistant messages).
+    # Append a dummy user message so the request ends with a user turn.
+    if inject_trailing_user_message and messages and messages[-1]["role"] == "assistant":
+        messages.append({"role": "user", "content": [{"text": ".", "type": "text"}]})
 
     return messages, AnthropicFormatData(system_messages=system_messages)
 
@@ -110,18 +134,30 @@ def _to_image_content(image: llm.ImageContent) -> dict[str, Any]:
     }
 
 
-def to_fnc_ctx(tool_ctx: llm.ToolContext) -> list[dict[str, Any]]:
+def to_fnc_ctx(tool_ctx: llm.ToolContext, *, strict: bool = True) -> list[dict[str, Any]]:
     schemas: list[dict[str, Any]] = []
     for tool in tool_ctx.function_tools.values():
         if isinstance(tool, llm.FunctionTool):
-            fnc = llm.utils.build_legacy_openai_schema(tool, internally_tagged=True)
-            schemas.append(
-                {
-                    "name": fnc["name"],
-                    "description": fnc["description"] or "",
-                    "input_schema": fnc["parameters"],
-                }
-            )
+            if strict:
+                fnc = llm.utils.build_strict_openai_schema(tool)
+                function_data = fnc["function"]
+                schemas.append(
+                    {
+                        "name": function_data["name"],
+                        "description": function_data.get("description") or "",
+                        "input_schema": function_data["parameters"],
+                        "strict": True,
+                    }
+                )
+            else:
+                fnc = llm.utils.build_legacy_openai_schema(tool, internally_tagged=True)
+                schemas.append(
+                    {
+                        "name": fnc["name"],
+                        "description": fnc["description"] or "",
+                        "input_schema": fnc["parameters"],
+                    }
+                )
         elif isinstance(tool, llm.RawFunctionTool):
             info = tool.info
             schemas.append(
@@ -131,4 +167,5 @@ def to_fnc_ctx(tool_ctx: llm.ToolContext) -> list[dict[str, Any]]:
                     "input_schema": info.raw_schema.get("parameters", {}),
                 }
             )
+
     return schemas

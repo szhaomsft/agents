@@ -5,10 +5,10 @@ from time import perf_counter
 
 import aiohttp
 
-from livekit.agents import Plugin, get_job_context, llm, utils
+from livekit.agents import LanguageCode, get_job_context, llm, utils
 from livekit.agents.inference_runner import _InferenceRunner
 
-from .base import MAX_HISTORY_TURNS, EOUModelBase, EOUPlugin, _EUORunnerBase
+from .base import MAX_HISTORY_TURNS, EOUModelBase, _EUORunnerBase
 from .log import logger
 from .models import EOUModelType
 
@@ -34,7 +34,7 @@ class MultilingualModel(EOUModelBase):
     def _inference_method(self) -> str:
         return _EUORunnerMultilingual.INFERENCE_METHOD
 
-    async def unlikely_threshold(self, language: str | None) -> float | None:
+    async def unlikely_threshold(self, language: LanguageCode | None) -> float | None:
         if not language:
             return None
 
@@ -45,7 +45,7 @@ class MultilingualModel(EOUModelBase):
                     async with utils.http_context.http_session().post(
                         url=url,
                         json={
-                            "language": language,
+                            "language": language.iso,
                         },
                         timeout=aiohttp.ClientTimeout(total=REMOTE_INFERENCE_TIMEOUT),
                     ) as resp:
@@ -53,7 +53,8 @@ class MultilingualModel(EOUModelBase):
                         data = await resp.json()
                         threshold = data.get("threshold")
                         if threshold:
-                            self._languages[language] = {"threshold": threshold}
+                            # cache by base language so the base class lookup finds it
+                            self._languages[language.language] = {"threshold": threshold}
             except Exception as e:
                 logger.warning("Error fetching threshold for language %s", language, exc_info=e)
 
@@ -74,7 +75,9 @@ class MultilingualModel(EOUModelBase):
         ).truncate(max_items=MAX_HISTORY_TURNS)
 
         ctx = get_job_context()
-        request = messages.to_dict(exclude_image=True, exclude_audio=True, exclude_timestamp=True)
+        request = messages.to_dict(
+            exclude_image=True, exclude_audio=True, exclude_timestamp=True, strip_markup=True
+        )
         request["jobId"] = ctx.job.id
         request["workerId"] = ctx.worker_id
         agent_id = os.getenv("LIVEKIT_AGENT_ID")
@@ -113,4 +116,3 @@ def _remote_inference_url() -> str | None:
 
 if not _remote_inference_url():
     _InferenceRunner.register_runner(_EUORunnerMultilingual)
-Plugin.register_plugin(EOUPlugin(_EUORunnerMultilingual))

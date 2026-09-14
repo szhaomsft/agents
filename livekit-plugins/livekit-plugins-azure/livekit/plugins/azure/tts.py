@@ -18,6 +18,7 @@ import queue
 import weakref
 from dataclasses import dataclass, replace
 from typing import Literal
+from urllib.parse import urlparse
 
 import aiohttp
 
@@ -29,7 +30,15 @@ except ImportError:
         "Install with: pip install azure-cognitiveservices-speech"
     )
 
-from livekit.agents import APIConnectionError, APIStatusError, APITimeoutError, tokenize, tts, utils
+from livekit.agents import (
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    LanguageCode,
+    tokenize,
+    tts,
+    utils,
+)
 from livekit.agents.types import (
     DEFAULT_API_CONNECT_OPTIONS,
     NOT_GIVEN,
@@ -126,11 +135,12 @@ class _TTSOptions:
     subscription_key: str | None
     region: str | None
     voice: str
-    language: str | None
+    language: LanguageCode | None
     speech_endpoint: str | None
     deployment_id: str | None
     prosody: NotGivenOr[ProsodyConfig]
     style: NotGivenOr[StyleConfig]
+    lexicon_uri: NotGivenOr[str]
     auth_token: str | None = None
 
     def get_endpoint_url(self) -> str:
@@ -152,6 +162,7 @@ class TTS(tts.TTS):
         sample_rate: int = 24000,
         prosody: NotGivenOr[ProsodyConfig] = NOT_GIVEN,
         style: NotGivenOr[StyleConfig] = NOT_GIVEN,
+        lexicon_uri: NotGivenOr[str] = NOT_GIVEN,
         speech_key: str | None = None,
         speech_region: str | None = None,
         speech_endpoint: str | None = None,
@@ -201,9 +212,10 @@ class TTS(tts.TTS):
             speech_endpoint=speech_endpoint,
             voice=voice,
             deployment_id=deployment_id,
-            language=language,
+            language=LanguageCode(language) if language else None,
             prosody=prosody,
             style=style,
+            lexicon_uri=lexicon_uri,
             auth_token=speech_auth_token,
         )
         self._streams = weakref.WeakSet[SynthesizeStream]()
@@ -213,7 +225,18 @@ class TTS(tts.TTS):
 
     @property
     def model(self) -> str:
-        return "unknown"
+        if self._opts.speech_endpoint:
+            endpoint = self._opts.speech_endpoint.strip()
+            parsed = urlparse(endpoint if "://" in endpoint else f"//{endpoint}")
+            location = parsed.hostname or endpoint
+        elif self._opts.region:
+            location = self._opts.region
+        else:
+            return "unknown"
+        model = f"{location}:{self._opts.voice}"
+        if self._opts.deployment_id:
+            model += f":{self._opts.deployment_id}"
+        return model
 
     @property
     def provider(self) -> str:
@@ -226,17 +249,20 @@ class TTS(tts.TTS):
         language: NotGivenOr[str] = NOT_GIVEN,
         prosody: NotGivenOr[ProsodyConfig] = NOT_GIVEN,
         style: NotGivenOr[StyleConfig] = NOT_GIVEN,
+        lexicon_uri: NotGivenOr[str] = NOT_GIVEN,
     ) -> None:
         if is_given(voice):
             self._opts.voice = voice
         if is_given(language):
-            self._opts.language = language
+            self._opts.language = LanguageCode(language)
         if is_given(prosody):
             prosody.validate()
             self._opts.prosody = prosody
         if is_given(style):
             style.validate()
             self._opts.style = style
+        if is_given(lexicon_uri):
+            self._opts.lexicon_uri = lexicon_uri
 
     def _ensure_session(self) -> aiohttp.ClientSession:
         if not self._session:
@@ -279,6 +305,10 @@ class ChunkedStream(tts.ChunkedStream):
             f'xml:lang="{lang}">'
         )
         ssml += f'<voice name="{self._opts.voice}">'
+
+        if is_given(self._opts.lexicon_uri):
+            ssml += f'<lexicon uri="{self._opts.lexicon_uri}"/>'
+
         if is_given(self._opts.style):
             degree = f' styledegree="{self._opts.style.degree}"' if self._opts.style.degree else ""
             ssml += f'<mstts:express-as style="{self._opts.style.style}"{degree}>'

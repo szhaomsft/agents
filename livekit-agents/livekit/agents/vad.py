@@ -6,7 +6,7 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncIterable, AsyncIterator
 from dataclasses import dataclass, field
 from enum import Enum, unique
-from typing import Literal, Union
+from typing import Literal
 
 from livekit import rtc
 from livekit.agents.metrics.base import Metadata
@@ -102,10 +102,11 @@ class VADStream(ABC):
     def __init__(self, vad: VAD) -> None:
         self._vad = vad
         self._last_activity_time = time.perf_counter()
-        self._input_ch = aio.Chan[Union[rtc.AudioFrame, VADStream._FlushSentinel]]()
+        self._input_ch = aio.Chan[rtc.AudioFrame | VADStream._FlushSentinel]()
         self._event_ch = aio.Chan[VADEvent]()
 
-        self._event_aiter, monitor_aiter = aio.itertools.tee(self._event_ch, 2)
+        self._tee_aiter = aio.itertools.tee(self._event_ch, 2)
+        self._event_aiter, monitor_aiter = self._tee_aiter
         self._metrics_task = asyncio.create_task(
             self._metrics_monitor_task(monitor_aiter), name="TTS._metrics_task"
         )
@@ -146,19 +147,25 @@ class VADStream(ABC):
                 self._last_activity_time = time.perf_counter()
 
     def push_frame(self, frame: rtc.AudioFrame) -> None:
-        """Push some text to be synthesized"""
+        """Push some audio frame to be analyzed"""
         self._check_input_not_ended()
         self._check_not_closed()
         self._input_ch.send_nowait(frame)
 
     def flush(self) -> None:
-        """Mark the end of the current segment"""
+        """Mark the end of the current segment.
+
+        Implementations MUST treat this as a hard segment boundary: drop any accumulated
+        speech/silence state so the next pushed frame starts a fresh segment. Used by the
+        pipeline to recover from out-of-band end-of-turn signals (e.g. STT EOS) without
+        tearing down and recreating the stream.
+        """
         self._check_input_not_ended()
         self._check_not_closed()
         self._input_ch.send_nowait(self._FlushSentinel())
 
     def end_input(self) -> None:
-        """Mark the end of input, no more text will be pushed"""
+        """Mark the end of input, no more audio will be pushed"""
         self.flush()
         self._input_ch.close()
 
@@ -168,6 +175,7 @@ class VADStream(ABC):
         await aio.cancel_and_wait(self._task)
         self._event_ch.close()
         await self._metrics_task
+        await self._tee_aiter.aclose()
 
     async def __anext__(self) -> VADEvent:
         try:

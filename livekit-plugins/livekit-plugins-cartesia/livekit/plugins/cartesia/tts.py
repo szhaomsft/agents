@@ -21,7 +21,7 @@ import os
 import weakref
 from collections import deque
 from dataclasses import dataclass, replace
-from typing import Any, Union, cast
+from typing import Any, cast
 
 import aiohttp
 
@@ -31,6 +31,7 @@ from livekit.agents import (
     APIError,
     APIStatusError,
     APITimeoutError,
+    LanguageCode,
     tokenize,
     tts,
     utils,
@@ -70,7 +71,7 @@ class _TTSOptions:
     volume: float | None
     word_timestamps: bool
     api_key: str
-    language: str | None
+    language: LanguageCode | None
     base_url: str
     api_version: str
     pronunciation_dict_id: str | None
@@ -87,7 +88,7 @@ class TTS(tts.TTS):
         self,
         *,
         api_key: str | None = None,
-        model: TTSModels | str = "sonic-2",
+        model: TTSModels | str = "sonic-3",
         language: str | None = "en",
         encoding: TTSEncoding = "pcm_s16le",
         voice: str | list[float] = TTSDefaultVoiceId,
@@ -109,7 +110,7 @@ class TTS(tts.TTS):
         See https://docs.cartesia.ai/reference/web-socket/stream-speech/stream-speech for more details on the Cartesia API.
 
         Args:
-            model (TTSModels, optional): The Cartesia TTS model to use. Defaults to "sonic-2".
+            model (TTSModels, optional): The Cartesia TTS model to use. Defaults to "sonic-3".
             language (str, optional): The language code for synthesis. Defaults to "en".
             encoding (TTSEncoding, optional): The audio encoding format. Defaults to "pcm_s16le".
             voice (str | list[float], optional): The voice ID or embedding array.
@@ -136,14 +137,17 @@ class TTS(tts.TTS):
         )
         cartesia_api_key = api_key or os.environ.get("CARTESIA_API_KEY")
         if not cartesia_api_key:
-            raise ValueError("CARTESIA_API_KEY must be set")
+            raise ValueError(
+                "Cartesia API key is required, either as argument or set"
+                " CARTESIA_API_KEY environment variable"
+            )
 
         if isinstance(emotion, str):
             emotion = [emotion]
 
         self._opts = _TTSOptions(
             model=model,
-            language=language,
+            language=LanguageCode(language) if language else None,
             encoding=encoding,
             sample_rate=sample_rate,
             voice=voice,
@@ -180,7 +184,7 @@ class TTS(tts.TTS):
         if word_timestamps:
             if "preview" not in self._opts.model and (
                 self._opts.language is not None
-                and self._opts.language
+                and self._opts.language.language
                 not in {
                     "en",
                     "de",
@@ -194,6 +198,11 @@ class TTS(tts.TTS):
                     " or all languages with `preview` models"
                 )
 
+    class Markup(tts.TTS.Markup):
+        # markup delegation lives in the base class, keyed on _provider_key()
+        def _provider_key(self) -> str:
+            return "cartesia"
+
     @property
     def model(self) -> str:
         return self._opts.model
@@ -204,12 +213,29 @@ class TTS(tts.TTS):
 
     async def _connect_ws(self, timeout: float) -> aiohttp.ClientWebSocketResponse:
         session = self._ensure_session()
-        url = self._opts.get_ws_url(
-            f"/tts/websocket?api_key={self._opts.api_key}&cartesia_version={self._opts.api_version}"
-        )
-        ws = await asyncio.wait_for(
-            session.ws_connect(url, headers={"User-Agent": USER_AGENT}), timeout
-        )
+        url = self._opts.get_ws_url(f"/tts/websocket?cartesia_version={self._opts.api_version}")
+        try:
+            ws = await asyncio.wait_for(
+                session.ws_connect(
+                    url,
+                    headers={
+                        "User-Agent": USER_AGENT,
+                        API_AUTH_HEADER: self._opts.api_key,
+                    },
+                ),
+                timeout,
+            )
+        except asyncio.TimeoutError:
+            raise APITimeoutError() from None
+        except aiohttp.ClientResponseError as e:
+            # authentication headers can appear in RequestInfo.
+            raise APIStatusError(
+                message=e.message, status_code=e.status, request_id=None, body=None
+            ) from None
+        except Exception as e:
+            # transport errors can contain credentials in URLs.
+            raise APIConnectionError(type(e).__name__) from None
+
         c_request_id = ws._response.headers.get(REQUEST_ID_HEADER)
         logger.debug(
             "Established new Cartesia TTS WebSocket connection",
@@ -248,7 +274,7 @@ class TTS(tts.TTS):
         and emotion. If any parameter is not provided, the existing value will be retained.
 
         Args:
-            model (TTSModels, optional): The Cartesia TTS model to use. Defaults to "sonic-2".
+            model (TTSModels, optional): The Cartesia TTS model to use. Defaults to "sonic-3".
             language (str, optional): The language code for synthesis. Defaults to "en".
             voice (str | list[float], optional): The voice ID or embedding array.
             speed (TTSVoiceSpeed | float, optional): Voice Control - Speed (https://docs.cartesia.ai/user-guides/voice-control)
@@ -258,20 +284,24 @@ class TTS(tts.TTS):
         if is_given(model):
             self._opts.model = model
         if is_given(language):
-            self._opts.language = language
+            self._opts.language = LanguageCode(language) if language else None
         if is_given(voice):
-            self._opts.voice = cast(Union[str, list[float]], voice)
+            self._opts.voice = voice
         if is_given(speed):
-            self._opts.speed = cast(Union[TTSVoiceSpeed, float], speed)
+            self._opts.speed = cast(TTSVoiceSpeed | float, speed)
         if is_given(emotion):
             emotion = [emotion] if isinstance(emotion, str) else emotion
-            self._opts.emotion = cast(list[Union[TTSVoiceEmotion, str]], emotion)
+            self._opts.emotion = emotion
         if is_given(volume):
             self._opts.volume = volume
         if is_given(pronunciation_dict_id):
             self._opts.pronunciation_dict_id = pronunciation_dict_id
-        if is_given(api_version):
+        if is_given(api_version) and api_version != self._opts.api_version:
             self._opts.api_version = api_version
+            # cartesia_version is a query parameter on the websocket URL, so a pooled
+            # socket keeps speaking the version it was opened with while
+            # _to_cartesia_options starts shaping the body for the new one.
+            self._pool.invalidate()
 
         if speed or emotion or volume or pronunciation_dict_id:
             self._check_generation_config()
@@ -345,7 +375,7 @@ class ChunkedStream(tts.ChunkedStream):
                 self._opts.get_http_url("/tts/bytes"),
                 headers={
                     API_AUTH_HEADER: self._opts.api_key,
-                    API_VERSION_HEADER: API_VERSION,
+                    API_VERSION_HEADER: self._opts.api_version,
                     "User-Agent": USER_AGENT,
                 },
                 json=json,
@@ -393,6 +423,7 @@ class SynthesizeStream(tts.SynthesizeStream):
         sent_tokens = deque[str]()
 
         sent_tokenizer_stream = self._tts._sentence_tokenizer.stream()
+        flush_on_chunk = isinstance(self._tts._sentence_tokenizer, tokenize.SentenceTokenizer)
         if self._tts._stream_pacer:
             sent_tokenizer_stream = self._tts._stream_pacer.wrap(
                 sent_stream=sent_tokenizer_stream,
@@ -403,6 +434,8 @@ class SynthesizeStream(tts.SynthesizeStream):
             ws: aiohttp.ClientWebSocketResponse, cartesia_context_id: str
         ) -> None:
             base_pkt = _to_cartesia_options(self._opts, streaming=True)
+            if flush_on_chunk is True:
+                base_pkt["max_buffer_delay_ms"] = 0
             async for ev in sent_tokenizer_stream:
                 token_pkt = base_pkt.copy()
                 token_pkt["context_id"] = cartesia_context_id
@@ -446,7 +479,10 @@ class SynthesizeStream(tts.SynthesizeStream):
                         extra={"cartesia_context_id": cartesia_context_id},
                     )
                     raise APIStatusError(
-                        "Cartesia connection closed unexpectedly", request_id=request_id
+                        "Cartesia connection closed unexpectedly",
+                        request_id=request_id,
+                        status_code=ws.close_code or -1,
+                        body=f"{msg.data=} {msg.extra=}",
                     )
 
                 if msg.type != aiohttp.WSMsgType.TEXT:
@@ -455,6 +491,10 @@ class SynthesizeStream(tts.SynthesizeStream):
 
                 data = json.loads(msg.data)
                 segment_id = data.get("context_id")
+                # A pooled websocket may still hold audio/done from an interrupted
+                # previous context; ignore messages tagged with another context id.
+                if segment_id is not None and segment_id != cartesia_context_id:
+                    continue
                 if current_segment_id is None:
                     current_segment_id = segment_id
                     output_emitter.start_segment(segment_id=segment_id)
@@ -469,7 +509,10 @@ class SynthesizeStream(tts.SynthesizeStream):
                 elif word_timestamps := data.get("word_timestamps"):
                     # assuming Cartesia echos the sent text in the original format and order.
                     for word, start, end in zip(
-                        word_timestamps["words"], word_timestamps["start"], word_timestamps["end"]
+                        word_timestamps["words"],
+                        word_timestamps["start"],
+                        word_timestamps["end"],
+                        strict=False,
                     ):
                         if not sent_tokens or skip_aligning:
                             word = f"{word} "
@@ -496,12 +539,16 @@ class SynthesizeStream(tts.SynthesizeStream):
                         extra={"cartesia_context_id": cartesia_context_id, "error": data},
                     )
                     raise APIError(f"Cartesia returned error: {data}")
+                elif data.get("type") == "flush_done":
+                    pass
                 else:
-                    logger.warning("unexpected message %s", data)
+                    logger.warning("unexpected message", extra={"lk.pii.data": data})
 
         cartesia_context_id = utils.shortuuid()
         try:
             async with self._tts._pool.connection(timeout=self._conn_options.timeout) as ws:
+                self._acquire_time = self._tts._pool.last_acquire_time
+                self._connection_reused = self._tts._pool.last_connection_reused
                 tasks = [
                     asyncio.create_task(_input_task()),
                     asyncio.create_task(_sentence_stream_task(ws, cartesia_context_id)),
@@ -520,6 +567,8 @@ class SynthesizeStream(tts.SynthesizeStream):
             raise APIStatusError(
                 message=e.message, status_code=e.status, request_id=None, body=None
             ) from None
+        except APIError:
+            raise
         except Exception as e:
             logger.exception(
                 "Cartesia connection error. Include the cartesia_context_id to support@cartesia.ai for help debugging.",
@@ -556,7 +605,7 @@ def _to_cartesia_options(opts: _TTSOptions, *, streaming: bool) -> dict[str, Any
             "encoding": opts.encoding,
             "sample_rate": opts.sample_rate,
         },
-        "language": opts.language,
+        "language": opts.language.language if opts.language else None,
     }
 
     if opts.pronunciation_dict_id:

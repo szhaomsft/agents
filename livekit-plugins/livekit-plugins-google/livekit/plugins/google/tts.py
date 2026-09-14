@@ -18,7 +18,10 @@ import asyncio
 import weakref
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, replace
+from typing import Any
 
+import google.auth
+import google.auth.credentials
 from google.api_core.client_options import ClientOptions
 from google.api_core.exceptions import DeadlineExceeded, GoogleAPICallError
 from google.cloud import texttospeech
@@ -27,7 +30,15 @@ from google.cloud.texttospeech_v1.types import (
     SsmlVoiceGender,
     SynthesizeSpeechResponse,
 )
-from livekit.agents import APIConnectOptions, APIStatusError, APITimeoutError, tokenize, tts, utils
+from livekit.agents import (
+    APIConnectOptions,
+    APIStatusError,
+    APITimeoutError,
+    LanguageCode,
+    tokenize,
+    tts,
+    utils,
+)
 from livekit.agents.types import DEFAULT_API_CONNECT_OPTIONS, NOT_GIVEN, NotGivenOr
 from livekit.agents.utils import is_given
 
@@ -64,10 +75,10 @@ class TTS(tts.TTS):
         gender: NotGivenOr[Gender | str] = NOT_GIVEN,
         voice_name: NotGivenOr[str] = NOT_GIVEN,
         voice_cloning_key: NotGivenOr[str] = NOT_GIVEN,
-        model_name: GeminiTTSModels | str = "gemini-2.5-flash-tts",
+        model_name: NotGivenOr[GeminiTTSModels | str] = NOT_GIVEN,
         prompt: NotGivenOr[str] = NOT_GIVEN,
         sample_rate: int = 24000,
-        pitch: int = 0,
+        pitch: float = 0,
         effects_profile_id: str = "",
         speaking_rate: float = 1.0,
         volume_gain_db: float = 0.0,
@@ -75,6 +86,7 @@ class TTS(tts.TTS):
         audio_encoding: texttospeech.AudioEncoding = texttospeech.AudioEncoding.PCM,  # type: ignore
         credentials_info: NotGivenOr[dict] = NOT_GIVEN,
         credentials_file: NotGivenOr[str] = NOT_GIVEN,
+        credentials: NotGivenOr[google.auth.credentials.Credentials] = NOT_GIVEN,
         tokenizer: NotGivenOr[tokenize.SentenceTokenizer] = NOT_GIVEN,
         custom_pronunciations: NotGivenOr[CustomPronunciations] = NOT_GIVEN,
         use_streaming: bool = True,
@@ -84,8 +96,9 @@ class TTS(tts.TTS):
         """
         Create a new instance of Google TTS.
 
-        Credentials must be provided, either by using the ``credentials_info`` dict, or reading
-        from the file specified in ``credentials_file`` or the ``GOOGLE_APPLICATION_CREDENTIALS``
+        Credentials must be provided, either as a ``google.auth.credentials.Credentials`` object
+        via ``credentials``, by using the ``credentials_info`` dict, by reading from the file
+        specified in ``credentials_file``, or via the ``GOOGLE_APPLICATION_CREDENTIALS``
         environmental variable.
 
         Args:
@@ -93,7 +106,7 @@ class TTS(tts.TTS):
             gender (Gender | str, optional): Voice gender ("male", "female", "neutral"). Default is "neutral".
             voice_name (str, optional): Specific voice name. Default is an empty string. See https://docs.cloud.google.com/text-to-speech/docs/gemini-tts#voice_options for supported voice in Gemini TTS models.
             voice_cloning_key (str, optional): Voice clone key. Created via https://cloud.google.com/text-to-speech/docs/chirp3-instant-custom-voice
-            model_name (GeminiTTSModels | str, optional): Model name for TTS (e.g., "gemini-2.5-flash-tts", "chirp_3"). Default is "gemini-2.5-flash-tts".
+            model_name (GeminiTTSModels | str, optional): Model name for TTS (e.g., "gemini-2.5-flash-tts", "chirp_3"). Default is "gemini-2.5-flash-tts" or "chirp_3" depending on the voice_name and voice_cloning_key.
             prompt (str, optional): Style prompt for Gemini TTS models. Controls tone, style, and speaking characteristics. Only applied to first input chunk in streaming mode.
             sample_rate (int, optional): Audio sample rate in Hz. Default is 24000.
             location (str, optional): Location for the TTS client. Default is "global".
@@ -103,6 +116,7 @@ class TTS(tts.TTS):
             volume_gain_db (float, optional): Volume gain in decibels. Default is 0.0. In the range [-96.0, 16.0]. Strongly recommended not to exceed +10 (dB).
             credentials_info (dict, optional): Dictionary containing Google Cloud credentials. Default is None.
             credentials_file (str, optional): Path to the Google Cloud credentials JSON file. Default is None.
+            credentials (google.auth.credentials.Credentials, optional): A credentials object to use directly, e.g. from Workload Identity Federation, where credentials are obtained in memory and never exist on disk. Takes precedence over ``credentials_info`` and ``credentials_file``. Default is NOT_GIVEN.
             tokenizer (tokenize.SentenceTokenizer, optional): Tokenizer for the TTS. Defaults to `livekit.agents.tokenize.blingfire.SentenceTokenizer`.
             custom_pronunciations (CustomPronunciations, optional): Custom pronunciations for the TTS. Default is None.
             use_streaming (bool, optional): Whether to use streaming synthesis. Default is True.
@@ -124,10 +138,26 @@ class TTS(tts.TTS):
         self._client: texttospeech.TextToSpeechAsyncClient | None = None
         self._credentials_info = credentials_info
         self._credentials_file = credentials_file
+        self._credentials = credentials
         self._location = location
 
-        lang = language if is_given(language) else DEFAULT_LANGUAGE
+        lang = LanguageCode(language) if is_given(language) else DEFAULT_LANGUAGE
         ssml_gender = _gender_from_str(DEFAULT_GENDER if not is_given(gender) else gender)
+
+        if not is_given(model_name):
+            # chirp3 voice name format: <locale>-<model>-<voice>
+            # only chirp 3 model can support voice cloning
+            if not is_given(prompt) and (
+                is_given(voice_cloning_key)
+                or (is_given(voice_name) and "chirp" in voice_name.lower())
+            ):
+                model_name = "chirp_3"
+                logger.debug(
+                    f"using {model_name} model for voice {voice_name or voice_cloning_key}"
+                )
+            else:
+                model_name = "gemini-2.5-flash-tts"
+                logger.debug(f"using default {model_name} model")
 
         voice_params = texttospeech.VoiceSelectionParams(
             language_code=lang,
@@ -201,9 +231,9 @@ class TTS(tts.TTS):
             speaking_rate (float, optional): Speed of speech.
             volume_gain_db (float, optional): Volume gain in decibels.
         """
-        params = {}
+        params: dict[str, Any] = {}
         if is_given(language):
-            params["language_code"] = str(language)
+            params["language_code"] = LanguageCode(language)
         if is_given(gender):
             params["ssml_gender"] = _gender_from_str(str(gender))
         if is_given(voice_name):
@@ -228,14 +258,23 @@ class TTS(tts.TTS):
             api_endpoint = f"{self._location}-texttospeech.googleapis.com"
 
         if self._client is None:
-            if self._credentials_info:
+            if is_given(self._credentials):
+                self._client = texttospeech.TextToSpeechAsyncClient(
+                    credentials=self._credentials,
+                    client_options=ClientOptions(api_endpoint=api_endpoint),
+                )
+            elif self._credentials_info:
                 self._client = texttospeech.TextToSpeechAsyncClient.from_service_account_info(
                     self._credentials_info, client_options=ClientOptions(api_endpoint=api_endpoint)
                 )
 
             elif self._credentials_file:
-                self._client = texttospeech.TextToSpeechAsyncClient.from_service_account_file(
-                    self._credentials_file, client_options=ClientOptions(api_endpoint=api_endpoint)
+                credentials, _ = google.auth.load_credentials_from_file(  # type: ignore[no-untyped-call]
+                    self._credentials_file,
+                    scopes=["https://www.googleapis.com/auth/cloud-platform"],
+                )
+                self._client = texttospeech.TextToSpeechAsyncClient(
+                    credentials=credentials, client_options=ClientOptions(api_endpoint=api_endpoint)
                 )
             else:
                 self._client = texttospeech.TextToSpeechAsyncClient(
@@ -318,7 +357,7 @@ class ChunkedStream(tts.ChunkedStream):
         except DeadlineExceeded:
             raise APITimeoutError() from None
         except GoogleAPICallError as e:
-            raise APIStatusError(e.message, status_code=e.code or -1) from e
+            raise APIStatusError(e.message, status_code=e.code or -1, body=f"{e.details}") from e
 
 
 class SynthesizeStream(tts.SynthesizeStream):
@@ -326,9 +365,9 @@ class SynthesizeStream(tts.SynthesizeStream):
         super().__init__(tts=tts, conn_options=conn_options)
         self._tts: TTS = tts
         self._opts = replace(tts._opts)
-        self._segments_ch = utils.aio.Chan[tokenize.SentenceStream]()
 
     async def _run(self, output_emitter: tts.AudioEmitter) -> None:
+        segments_ch = utils.aio.Chan[tokenize.SentenceStream]()
         encoding = self._opts.encoding
         if encoding not in (texttospeech.AudioEncoding.OGG_OPUS, texttospeech.AudioEncoding.PCM):
             enc_name = texttospeech.AudioEncoding._member_names_[encoding]
@@ -362,17 +401,17 @@ class SynthesizeStream(tts.SynthesizeStream):
                 if isinstance(input, str):
                     if input_stream is None:
                         input_stream = self._opts.tokenizer.stream()
-                        self._segments_ch.send_nowait(input_stream)
+                        segments_ch.send_nowait(input_stream)
                     input_stream.push_text(input)
                 elif isinstance(input, self._FlushSentinel):
                     if input_stream:
                         input_stream.end_input()
                     input_stream = None
 
-            self._segments_ch.close()
+            segments_ch.close()
 
         async def _run_segments() -> None:
-            async for input_stream in self._segments_ch:
+            async for input_stream in segments_ch:
                 await self._run_stream(input_stream, output_emitter, streaming_config)
 
         tasks = [
@@ -427,9 +466,14 @@ class SynthesizeStream(tts.SynthesizeStream):
         except DeadlineExceeded:
             raise APITimeoutError() from None
         except GoogleAPICallError as e:
-            raise APIStatusError(e.message, status_code=e.code or -1) from e
+            raise APIStatusError(e.message, status_code=e.code or -1, body=f"{e.details}") from e
         finally:
-            await input_gen.aclose()
+            # the transport may still be parked inside input_gen; closing it then raises
+            # RuntimeError and would mask the real error
+            try:
+                await input_gen.aclose()
+            except Exception:
+                pass
 
 
 def _gender_from_str(gender: str) -> SsmlVoiceGender:
@@ -452,4 +496,7 @@ def _encoding_to_mimetype(encoding: texttospeech.AudioEncoding) -> str:
     elif encoding == texttospeech.AudioEncoding.OGG_OPUS:
         return "audio/opus"
     else:
-        raise RuntimeError(f"encoding {encoding} isn't supported")
+        raise RuntimeError(
+            f"encoding {encoding} isn't supported, supported encodings: "
+            "PCM, LINEAR16, MP3, OGG_OPUS"
+        )

@@ -19,7 +19,7 @@ from livekit.agents import (
     llm,
 )
 from livekit.agents.voice.agent import ModelSettings
-from livekit.plugins import deepgram, openai, silero
+from livekit.plugins import deepgram, openai
 
 load_dotenv()
 
@@ -46,7 +46,6 @@ class RetrievalAgent(Agent):
                 "with users will be voice. You should use short and concise "
                 "responses, and avoiding usage of unpronouncable punctuation."
             ),
-            vad=silero.VAD.load(),
             stt=deepgram.STT(),
             llm=openai.LLM(),
             tts=openai.TTS(),
@@ -80,7 +79,8 @@ class RetrievalAgent(Agent):
             system_msg.content.append(instructions)
         else:
             chat_ctx.items.insert(0, llm.ChatMessage(role="system", content=[instructions]))
-        print(f"update instructions: {instructions[:100].replace('\n', '\\n')}...")
+        preview = instructions[:100].replace("\n", "\\n")
+        print(f"update instructions: {preview}...")
 
         # update the instructions for agent
         # await self.update_instructions(instructions)

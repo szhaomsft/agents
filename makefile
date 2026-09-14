@@ -82,6 +82,10 @@ check: format-check lint type-check ## Run all checks (format, lint, type-check)
 
 fix: format lint-fix ## Run format and lint checks and fix issues automatically (format, lint)
 
+unit-tests: ## Run hermetic tests: the `unit` and `audio_eot` categories (no cloud accounts)
+	@echo "$(BOLD)$(CYAN)Running unit tests...$(RESET)"
+	PYTHONPATH="$$PWD" uv run pytest --unit --audio_eot $(PYTEST_ARGS)
+
 # ============================================
 # Development Workflows
 # ============================================

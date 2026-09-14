@@ -7,25 +7,18 @@ format `[SPEAKER_ID]TEXT[/SPEAKER_ID]` for testing.
 
 import re
 
-from livekit.agents import stt
-from livekit.agents.voice.audio_recognition import AudioRecognition
+import pytest
+
+from livekit.agents import LanguageCode, stt
+
+pytestmark = pytest.mark.unit
 
 
 class TestSpeakerIdGrouping:
     """Test cases for speaker ID grouping functionality."""
 
-    def setup_method(self):
-        """Set up a fresh AudioRecognition instance for each test."""
-        self.audio_recognition = AudioRecognition(
-            hooks=None,  # type: ignore
-            stt=None,
-            vad=None,
-            min_endpointing_delay=0.5,
-            max_endpointing_delay=2.0,
-            turn_detection=None,
-        )
-
     def _format_text(self, text, speaker_id):
+        text = text.strip()
         if speaker_id:
             return f"[{speaker_id}]{text}[/{speaker_id}]"
         return text
@@ -35,14 +28,14 @@ class TestSpeakerIdGrouping:
         result = ""
         for text, speaker_id in fragments:
             # Skip speakers to ignore
-            if re.match(r"^__[A-Z0-9_]{2,}__$", speaker_id):
+            if speaker_id and re.match(r"^__[A-Z0-9_]{2,}__$", speaker_id):
                 continue
 
             # Create a SpeakerSpeechData object and get formatted text
             speech_data = stt.SpeechData(
                 text=self._format_text(text, speaker_id),
                 speaker_id=speaker_id,
-                language="en",
+                language=LanguageCode("en"),
                 start_time=0,
                 end_time=0,
                 confidence=1.0,

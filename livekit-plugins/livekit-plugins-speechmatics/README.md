@@ -19,9 +19,45 @@ Speechmatics STT engine can be configured to emit information about individual s
 
 You should adjust your system instructions to inform the LLM of this format for speaker identification.
 
+## Turn detection modes
+
+The `turn_detection_mode` parameter controls how end-of-turn is detected:
+
+- `EXTERNAL` (default) — Speechmatics does not endpoint on its own; turn boundaries are driven by an external VAD or by calling `finalize()`. If no `vad` is passed, Silero is auto-loaded (requires `livekit-plugins-silero`). Pass `vad=None` to opt out and drive `finalize()` yourself.
+- `ADAPTIVE` — Speechmatics controls end of turn using its own VAD and the pace of speech.
+- `SMART_TURN` — Speechmatics ML-based endpointing.
+- `FIXED` — Endpoints after a fixed silence duration set by `end_of_utterance_silence_trigger`.
+
+## Usage (LiveKit Turn Detection)
+
+The default `EXTERNAL` mode pairs naturally with LiveKit's turn detector. The format for the output text needs to be adjusted to not include any extra content at the end of the utterance. Using `[Speaker S1] ...` as the `speaker_active_format` should work well. You may need to adjust your system instructions to inform the LLM of this format for speaker identification. You must also include the listener for when the VAD has detected the end of speech.
+
+The `end_of_utterance_silence_trigger` parameter controls the amount of silence before the end of turn detection is triggered. The default is `0.5` seconds.
+
+Usage:
+
+```python
+from livekit.agents import AgentSession, inference
+from livekit.agents.inference import TurnDetector
+from livekit.plugins import speechmatics
+
+agent = AgentSession(
+    stt=speechmatics.STT(
+        end_of_utterance_silence_trigger=0.2,
+        speaker_active_format="[Speaker {speaker_id}] {text}",
+        speaker_passive_format="[Speaker {speaker_id} *PASSIVE*] {text}",
+    ),
+    vad=inference.VAD(),
+    turn_detection=TurnDetector(),
+    min_endpointing_delay=0.3,
+    max_endpointing_delay=5.0,
+    ...
+)
+```
+
 ## Usage (Speechmatics end of utterance detection and speaker ID)
 
-To use the Speechmatics end of utterance detection and speaker ID, you can use the following configuration:
+To delegate end-of-turn detection to Speechmatics, set `turn_detection_mode=TurnDetectionMode.ADAPTIVE` (or `SMART_TURN` / `FIXED`) and pair it with `turn_detection="stt"` on the `AgentSession`.
 
 ```python
 from livekit.agents import AgentSession
@@ -29,9 +65,9 @@ from livekit.plugins import speechmatics
 
 agent = AgentSession(
     stt=speechmatics.STT(
-        end_of_utterance_silence_trigger=0.5,
-        enable_diarization=True,
-        speaker_active_format="<{speaker_id}>{text}</{speaker_id}>",
+        turn_detection_mode=speechmatics.TurnDetectionMode.ADAPTIVE,
+        speaker_active_format="[Speaker {speaker_id}] {text}",
+        speaker_passive_format="[Speaker {speaker_id} *PASSIVE*] {text}",
         additional_vocab=[
             speechmatics.AdditionalVocabEntry(
                 content="LiveKit",
@@ -39,37 +75,10 @@ agent = AgentSession(
             ),
         ],
     ),
+    turn_detection="stt",
     ...
 )
 ```
-
-Note: Using the `end_of_utterance_silence_trigger` parameter will tell the STT engine to wait for this period of time from the last detected speech and then emit the full utterance to LiveKit. This may conflict with LiveKit's end of turn detection, so you may need to adjust the `min_endpointing_delay` and `max_endpointing_delay` parameters accordingly.
-
-## Usage (LiveKit Turn Detection)
-
-To use the LiveKit end of turn detection, the format for the output text needs to be adjusted to not include any extra content at the end of the utterance. Using `[Speaker S1] ...` as the `speaker_active_format` should work well. You may need to adjust your system instructions to inform the LLM of this format for speaker identification.
-
-Usage:
-
-```python
-from livekit.agents import AgentSession
-from livekit.plugins.turn_detector.english import EnglishModel
-from livekit.plugins import speechmatics
-
-agent = AgentSession(
-    stt=speechmatics.STT(
-        enable_diarization=True,
-        end_of_utterance_mode=speechmatics.EndOfUtteranceMode.NONE,
-        speaker_active_format="[Speaker {speaker_id}] {text}",
-    ),
-    turn_detector=EnglishModel(),
-    min_endpointing_delay=0.5,
-    max_endpointing_delay=5.0,
-    ...
-)
-```
-
-Note: The plugin was built with LiveKit's [end-of-turn detection feature](https://docs.livekit.io/agents/v1/build/turn-detection/) in mind, and it doesn't implement phrase endpointing. `AddTranscript` and `AddPartialTranscript` events are emitted as soon as they’re received from the Speechmatics STT engine.
 
 ## Pre-requisites
 

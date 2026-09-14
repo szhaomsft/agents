@@ -30,7 +30,7 @@ def new_inference_session(
             raise FileNotFoundError(f"Silero VAD model file not found: {onnx_file_path}")
         if not onnx_file_path.is_file():
             raise FileNotFoundError(f"`onnx_file_path` specified is not a file: {onnx_file_path}")
-        ctx = nullcontext(onnx_file_path)
+        ctx = nullcontext(onnx_file_path)  # type: ignore[assignment]
         path = str(_resource_files.enter_context(ctx))
 
     opts = onnxruntime.SessionOptions()
@@ -83,6 +83,11 @@ class OnnxModel:
     @property
     def context_size(self) -> int:
         return self._context_size
+
+    def reset(self) -> None:
+        self._context.fill(0)
+        self._rnn_state.fill(0)
+        self._input_buffer.fill(0)
 
     def __call__(self, x: np.ndarray) -> float:
         self._input_buffer[:, : self._context_size] = self._context

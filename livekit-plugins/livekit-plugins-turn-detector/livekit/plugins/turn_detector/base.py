@@ -12,7 +12,7 @@ from typing import Any
 
 from huggingface_hub import errors
 
-from livekit.agents import Plugin, llm
+from livekit.agents import LanguageCode, Plugin, llm
 from livekit.agents.inference_runner import _InferenceRunner
 from livekit.agents.ipc.inference_executor import InferenceExecutor
 from livekit.agents.job import get_job_context
@@ -35,7 +35,7 @@ def _download_from_hf_hub(repo_id: str, filename: str, **kwargs: Any) -> str:
         logger.error(
             f'Could not find file "{filename}". '
             "Make sure you have downloaded the model before running the agent. "
-            "Use `python3 your_agent.py download-files` to download the model."
+            "Use `python -m livekit.agents download-files` to download the model."
         )
         raise RuntimeError(
             "livekit-plugins-turn-detector initialization failed. "
@@ -108,7 +108,7 @@ class _EUORunnerBase(_InferenceRunner):
         try:
             import onnxruntime as ort  # type: ignore
             from huggingface_hub import errors
-            from transformers import AutoTokenizer  # type: ignore
+            from transformers import AutoTokenizer
         finally:
             logger.removeFilter(filt)
 
@@ -130,7 +130,7 @@ class _EUORunnerBase(_InferenceRunner):
             self._session = ort.InferenceSession(
                 local_path_onnx, providers=["CPUExecutionProvider"], sess_options=sess_options
             )
-            self._tokenizer = AutoTokenizer.from_pretrained(
+            self._tokenizer = AutoTokenizer.from_pretrained(  # type: ignore[no-untyped-call]
                 HG_MODEL,
                 revision=revision,
                 local_files_only=True,
@@ -141,7 +141,7 @@ class _EUORunnerBase(_InferenceRunner):
             logger.error(
                 f"Could not find model {HG_MODEL} with revision {revision}. "
                 "Make sure you have downloaded the model before running the agent. "
-                "Use `python3 your_agent.py download-files` to download the models."
+                "Use `python -m livekit.agents download-files` to download the models."
             )
             raise RuntimeError(
                 "livekit-plugins-turn-detector initialization failed. "
@@ -181,7 +181,7 @@ class _EUORunnerBase(_InferenceRunner):
         from transformers import AutoTokenizer
 
         # ensure the tokenizer is downloaded
-        AutoTokenizer.from_pretrained(HG_MODEL, revision=cls.model_revision())
+        AutoTokenizer.from_pretrained(HG_MODEL, revision=cls.model_revision())  # type: ignore[no-untyped-call]
         _download_from_hf_hub(
             HG_MODEL, ONNX_FILENAME, subfolder="onnx", revision=cls.model_revision()
         )
@@ -233,18 +233,16 @@ class EOUModelBase(ABC):
     @abstractmethod
     def _inference_method(self) -> str: ...
 
-    async def unlikely_threshold(self, language: str | None) -> float | None:
+    async def unlikely_threshold(self, language: LanguageCode | None) -> float | None:
         if language is None:
             return None
 
         # try the full language code first
-        lang = language.lower()
-        lang_data = self._languages.get(lang)
+        lang_data = self._languages.get(language.iso)
 
         # try the base language if the full language code is not found
-        if lang_data is None and "-" in lang:
-            base_lang = lang.split("-")[0]
-            lang_data = self._languages.get(base_lang)
+        if lang_data is None:
+            lang_data = self._languages.get(language.language)
 
         if not lang_data:
             return None
@@ -255,7 +253,7 @@ class EOUModelBase(ABC):
         else:
             return lang_data["threshold"]  # type: ignore
 
-    async def supports_language(self, language: str | None) -> bool:
+    async def supports_language(self, language: LanguageCode | None) -> bool:
         return await self.unlikely_threshold(language) is not None
 
     # our EOU model inference should be fast, 3 seconds is more than enough
@@ -266,18 +264,15 @@ class EOUModelBase(ABC):
         timeout: float | None = 3,
     ) -> float:
         messages: list[dict[str, Any]] = []
-        for item in chat_ctx.items:
-            if item.type != "message":
+        for msg in chat_ctx.messages():
+            if msg.role not in ("user", "assistant"):
                 continue
 
-            if item.role not in ("user", "assistant"):
-                continue
-
-            text_content = item.text_content
+            text_content = msg.text_content
             if text_content:
                 messages.append(
                     {
-                        "role": item.role,
+                        "role": msg.role,
                         "content": text_content,
                     }
                 )
@@ -291,5 +286,8 @@ class EOUModelBase(ABC):
         assert result is not None, "end_of_utterance prediction should always returns a result"
 
         result_json: dict[str, Any] = json.loads(result.decode())
-        logger.debug("eou prediction", extra=result_json)
+        log_extra = {**result_json}
+        if "input" in log_extra:
+            log_extra["lk.pii.input"] = log_extra.pop("input")
+        logger.debug("eou prediction", extra=log_extra)
         return result_json["eou_probability"]  # type: ignore

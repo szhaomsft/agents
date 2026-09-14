@@ -26,7 +26,7 @@ As of 2025-05-28, the following events are supported:
 
 from __future__ import annotations
 
-from typing import Any, Literal, Union
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
@@ -61,6 +61,18 @@ class UserTextMessageEvent(UltravoxEvent):
         alias="deferResponse",
         description="If true, allows adding text without inducing immediate response",
     )
+
+
+class ForcedAgentMessageEvent(UltravoxEvent):
+    """Instructs the agent to speak text verbatim (ForcedAgentMessage in Ultravox docs)."""
+
+    type: Literal["forced_agent_message"] = "forced_agent_message"
+    content: str = Field("", description="Text the agent should speak")
+    uninterruptible: bool | None = Field(
+        None, description="Prevents user interruption while the agent speaks this message"
+    )
+    urgency: Literal["immediate", "soon"] | None = Field(None, description="Message urgency level")
+    thread_id: str | None = Field(None, alias="threadId", description="Target thread identifier")
 
 
 class SetOutputMediumEvent(UltravoxEvent):
@@ -155,19 +167,20 @@ class PlaybackClearBufferEvent(UltravoxEvent):
 
 
 # Union type for all possible events
-UltravoxEventType = Union[
-    PingEvent,
-    UserTextMessageEvent,
-    SetOutputMediumEvent,
-    ClientToolResultEvent,
-    CallStartedEvent,
-    PongEvent,
-    StateEvent,
-    TranscriptEvent,
-    ClientToolInvocationEvent,
-    DebugEvent,
-    PlaybackClearBufferEvent,
-]
+UltravoxEventType = (
+    PingEvent
+    | UserTextMessageEvent
+    | ForcedAgentMessageEvent
+    | SetOutputMediumEvent
+    | ClientToolResultEvent
+    | CallStartedEvent
+    | PongEvent
+    | StateEvent
+    | TranscriptEvent
+    | ClientToolInvocationEvent
+    | DebugEvent
+    | PlaybackClearBufferEvent
+)
 UltravoxEventAdapter: TypeAdapter[UltravoxEventType] = TypeAdapter(UltravoxEventType)
 
 

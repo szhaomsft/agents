@@ -7,7 +7,7 @@ from collections.abc import AsyncIterable, AsyncIterator
 from dataclasses import dataclass, field
 from enum import Enum, unique
 from types import TracebackType
-from typing import Generic, Literal, TypeVar, Union
+from typing import TYPE_CHECKING, Any, Generic, Literal, Protocol, TypeVar, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -15,6 +15,7 @@ from livekit import rtc
 from livekit.agents.metrics.base import Metadata
 
 from .._exceptions import APIConnectionError, APIError
+from ..language import LanguageCode
 from ..log import logger
 from ..metrics import STTMetrics
 from ..types import (
@@ -26,6 +27,10 @@ from ..types import (
 )
 from ..utils import AudioBuffer, aio, is_given
 from ..utils.audio import calculate_audio_duration
+
+if TYPE_CHECKING:
+    from ..llm.chat_context import MetricsMetadata
+    from ..voice.events import ConversationItemAddedEvent
 
 
 @unique
@@ -51,7 +56,7 @@ class SpeechEventType(str, Enum):
 
 @dataclass
 class SpeechData:
-    language: str
+    language: LanguageCode
     text: str
     start_time: float = 0.0
     end_time: float = 0.0
@@ -59,11 +64,53 @@ class SpeechData:
     speaker_id: str | None = None
     is_primary_speaker: bool | None = None
     words: list[TimedString] | None = None
+    source_languages: list[LanguageCode] | None = None
+    """the source languages spoken by the user. populated by STT services that support translation,
+    where `language` holds the target language and `source_languages` holds the original spoken language(s),
+    or by multi-language detection services where `language` holds the dominant language and
+    `source_languages` holds all detected languages sorted by prevalence.
+    may contain multiple entries when a single utterance spans multiple source languages."""
+    source_texts: list[str] | None = None
+    """the original transcription segments in the source language(s), when translation is active.
+    each entry corresponds to the same-indexed entry in `source_languages`."""
+    target_languages: list[LanguageCode] | None = None
+    """the target language(s) produced by a translation-capable STT service, one entry per
+    consecutive same-language run, parallel to `target_texts`. mirrors `source_languages` /
+    `source_texts` on the source side: `language` holds the dominant (first) target language
+    and `target_languages` carries the fine-grained per-run breakdown.
+    populated when translation is active; None otherwise."""
+    target_texts: list[str] | None = None
+    """the translated transcription segments in the target language(s).
+    each entry corresponds to the same-indexed entry in `target_languages`."""
+    metadata: dict[str, Any] | None = None
+    """optional plugin-specific metadata (e.g. voice profile, provider diagnostics).
+    plugins may populate this with provider-specific data that doesn't map to standard fields."""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.language, LanguageCode) and isinstance(self.language, str):
+            self.language = LanguageCode(self.language)
+        if self.source_languages is not None:
+            self.source_languages = [
+                LanguageCode(lang)
+                if not isinstance(lang, LanguageCode) and isinstance(lang, str)
+                else lang
+                for lang in self.source_languages
+            ]
+        if self.target_languages is not None:
+            self.target_languages = [
+                LanguageCode(lang)
+                if not isinstance(lang, LanguageCode) and isinstance(lang, str)
+                else lang
+                for lang in self.target_languages
+            ]
 
 
 @dataclass
 class RecognitionUsage:
     audio_duration: float
+    """Incremental audio duration/usage in seconds"""
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 @dataclass
@@ -72,6 +119,13 @@ class SpeechEvent:
     request_id: str = ""
     alternatives: list[SpeechData] = field(default_factory=list)
     recognition_usage: RecognitionUsage | None = None
+    speech_start_time: float | None = None
+    """server-reported wall-clock time of speech onset, when the provider sends
+    a separate speech-start signal carrying onset timing."""
+    created_at: float = field(default_factory=lambda: time.time())
+    """Wall-clock time when this event was created."""
+    speech_end_time: float | None = None
+    """Wall-clock time when the recognized speech ended, when known."""
 
 
 @dataclass
@@ -82,6 +136,10 @@ class STTCapabilities:
     aligned_transcript: Literal["word", "chunk", False] = False
     offline_recognize: bool = True
     """Whether the STT supports batch recognition via recognize() method"""
+    keyterms: bool = False
+    """Whether the STT supports keyterm prompting"""
+    chat_context: bool = False
+    """Whether the STT can natively consume conversation context (see STT._push_conversation_item)"""
 
 
 class STTError(BaseModel):
@@ -98,7 +156,7 @@ TEvent = TypeVar("TEvent")
 
 class STT(
     ABC,
-    rtc.EventEmitter[Union[Literal["metrics_collected", "error"], TEvent]],
+    rtc.EventEmitter[Literal["metrics_collected", "error"] | TEvent],
     Generic[TEvent],
 ):
     def __init__(self, *, capabilities: STTCapabilities) -> None:
@@ -106,6 +164,8 @@ class STT(
         self._capabilities = capabilities
         self._label = f"{type(self).__module__}.{type(self).__name__}"
         self._recognize_metrics_needed = True
+        self._keyterms_unsupported_warned = False
+        self._chat_context_unsupported_warned = False
 
     @property
     def label(self) -> str:
@@ -134,6 +194,11 @@ class STT(
             Plugins should override this property to provide their provider information.
         """
         return "unknown"
+
+    @property
+    def metrics_metadata(self) -> MetricsMetadata:
+        """Metadata used to label turn metrics emitted for this STT instance."""
+        return {"model_name": self.model, "model_provider": self.provider}
 
     @property
     def capabilities(self) -> STTCapabilities:
@@ -191,10 +256,9 @@ class STT(
                 else:
                     self._emit_error(e, recoverable=True)
                     logger.warning(
-                        f"failed to recognize speech, retrying in {retry_interval}s",
-                        exc_info=e,
+                        f"failed to recognize speech: {e}, retrying in {retry_interval}s",
                         extra={
-                            "tts": self._label,
+                            "stt": self._label,
                             "attempt": i + 1,
                             "streamed": False,
                         },
@@ -218,6 +282,37 @@ class STT(
                 recoverable=recoverable,
             ),
         )
+
+    def _update_session_keyterms(self, keyterms: list[str]) -> None:
+        """Set the framework-managed keyterms (session config + auto-detection).
+
+        Internal hook called by the framework, kept separate from the user's own keyterms
+        (constructor / ``update_options``). Plugins that support keyterms override this to
+        store the session set and apply it merged with the user keyterms.
+        """
+        if not self._capabilities.keyterms:
+            if not self._keyterms_unsupported_warned:
+                self._keyterms_unsupported_warned = True
+                logger.warning(
+                    "keyterms are not supported by this STT, ignoring keyterms update",
+                    extra={"stt": self._label},
+                )
+            return
+
+    def _push_conversation_item(self, ev: ConversationItemAddedEvent) -> None:
+        """Feed a new conversation turn to the STT to bias recognition (context carryover).
+
+        Plugins with native context support set ``STTCapabilities.chat_context`` and override
+        this to forward the item to their provider's carryover field.
+        """
+        if not self._capabilities.chat_context:
+            if not self._chat_context_unsupported_warned:
+                self._chat_context_unsupported_warned = True
+                logger.warning(
+                    "chat context is not supported by this STT, ignoring chat context update",
+                    extra={"stt": self._label},
+                )
+            return
 
     def stream(
         self,
@@ -249,6 +344,18 @@ class STT(
         pass
 
 
+@runtime_checkable
+class SpeakerContext(Protocol):
+    """Protocol for STT context models that can generate LLM instructions.
+
+    STT plugins that provide speaker metadata should implement this protocol
+    on their context model so the expressive system can auto-inject
+    speaker context into the LLM.
+    """
+
+    def to_instructions(self) -> str: ...
+
+
 class RecognizeStream(ABC):
     class _FlushSentinel:
         """Sentinel to mark when it was flushed"""
@@ -272,7 +379,7 @@ class RecognizeStream(ABC):
         """
         self._stt = stt
         self._conn_options = conn_options
-        self._input_ch = aio.Chan[Union[rtc.AudioFrame, RecognizeStream._FlushSentinel]]()
+        self._input_ch = aio.Chan[rtc.AudioFrame | RecognizeStream._FlushSentinel]()
         self._event_ch = aio.Chan[SpeechEvent]()
 
         self._tee = aio.itertools.tee(self._event_ch, 2)
@@ -290,6 +397,22 @@ class RecognizeStream(ABC):
         self._resampler: rtc.AudioResampler | None = None
 
         self._start_time_offset: float = 0.0
+        self._start_time: float = time.time()
+        self._context: BaseModel | None = None
+
+    @property
+    def context(self) -> BaseModel | None:
+        """Persistent speaker metadata updated by the STT plugin during recognition.
+
+        STT plugins set this to a ``BaseModel`` instance (e.g. a voice profile with
+        emotion, gender, etc.) as they learn about the speaker over the life of the
+        stream.  Accessible via ``agent.audio_recognition.stt_context``.
+        """
+        return self._context
+
+    @context.setter
+    def context(self, value: BaseModel | None) -> None:
+        self._context = value
 
     @property
     def start_time_offset(self) -> float:
@@ -300,6 +423,41 @@ class RecognizeStream(ABC):
         if value < 0:
             raise ValueError("start_time_offset must be non-negative")
         self._start_time_offset = value
+
+    @property
+    def start_time(self) -> float:
+        """Wall-clock anchor for the stream. Seeded to `time.time()` when the
+        stream is initialized (and re-seeded on each retry). Plugins may
+        override this via the setter to anchor it at a more accurate moment
+        (e.g., when the first audio frame is sent to the provider) so that
+        server-provided stream-relative timestamps (like
+        `SpeechEvent.speech_start_time`) can be converted to wall-clock
+        accurately.
+        """
+        return self._start_time
+
+    @start_time.setter
+    def start_time(self, value: float) -> None:
+        if value < 0:
+            raise ValueError("start_time must be non-negative")
+        self._start_time = value
+
+    def _report_connection_acquired(self, acquire_time: float, connection_reused: bool) -> None:
+        """Report connection timing as an STTMetrics event with zero usage."""
+        self._stt.emit(
+            "metrics_collected",
+            STTMetrics(
+                request_id="",
+                timestamp=time.time(),
+                duration=0.0,
+                label=self._stt._label,
+                audio_duration=0.0,
+                streamed=True,
+                acquire_time=acquire_time,
+                connection_reused=connection_reused,
+                metadata=Metadata(model_name=self._stt.model, model_provider=self._stt.provider),
+            ),
+        )
 
     @abstractmethod
     async def _run(self) -> None: ...
@@ -313,10 +471,11 @@ class RecognizeStream(ABC):
         while self._num_retries <= max_retries:
             try:
                 self._start_time_offset += time.time() - last_start_time
+                self._start_time = time.time()
                 last_start_time = time.time()
                 return await self._run()
             except APIError as e:
-                if max_retries == 0:
+                if not e.retryable or max_retries == 0:
                     self._emit_error(e, recoverable=False)
                     raise
                 elif self._num_retries == max_retries:
@@ -329,10 +488,9 @@ class RecognizeStream(ABC):
 
                     retry_interval = self._conn_options._interval_for_retry(self._num_retries)
                     logger.warning(
-                        f"failed to recognize speech, retrying in {retry_interval}s",
-                        exc_info=e,
+                        f"failed to recognize speech: {e}, retrying in {retry_interval}s",
                         extra={
-                            "tts": self._stt._label,
+                            "stt": self._stt._label,
                             "attempt": self._num_retries,
                             "streamed": True,
                         },
@@ -371,6 +529,8 @@ class RecognizeStream(ABC):
                     duration=0.0,
                     label=self._stt._label,
                     audio_duration=ev.recognition_usage.audio_duration,
+                    input_tokens=ev.recognition_usage.input_tokens,
+                    output_tokens=ev.recognition_usage.output_tokens,
                     streamed=True,
                     metadata=Metadata(
                         model_name=self._stt.model, model_provider=self._stt.provider

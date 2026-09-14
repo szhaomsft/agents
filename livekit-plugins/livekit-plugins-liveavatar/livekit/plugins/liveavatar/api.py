@@ -1,7 +1,12 @@
+from __future__ import annotations
+
 import asyncio
 import logging
 import os
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .avatar import VideoQuality
 
 import aiohttp
 
@@ -31,7 +36,7 @@ class LiveAvatarAPI:
         *,
         api_url: str = DEFAULT_API_URL,
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
-        session: Optional[aiohttp.ClientSession] = None,
+        session: aiohttp.ClientSession | None = None,
     ) -> None:
         self._api_key = api_key or os.getenv("LIVEAVATAR_API_KEY")
         if self._api_key is None:
@@ -53,6 +58,8 @@ class LiveAvatarAPI:
         livekit_token: str,
         room: rtc.Room,
         avatar_id: str,
+        is_sandbox: bool = False,
+        video_quality: VideoQuality | None = None,
     ) -> dict[str, Any]:
         """Create a new streaming session, return a session id"""
 
@@ -62,11 +69,15 @@ class LiveAvatarAPI:
             "livekit_client_token": livekit_token,
         }
 
-        payload = {
-            "mode": "CUSTOM",
+        payload: dict[str, Any] = {
+            "mode": "LITE",
             "avatar_id": avatar_id,
+            "is_sandbox": is_sandbox,
             "livekit_config": livekit_config,
         }
+
+        if video_quality is not None:
+            payload["video_quality"] = video_quality
 
         self._headers = {
             "accept": "application/json",
@@ -110,6 +121,9 @@ class LiveAvatarAPI:
                             body=text,
                         )
                     return await response.json()  # type: ignore
+            except APIStatusError as e:
+                if not e.retryable or i >= self._conn_options.max_retry - 1:
+                    raise
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 logger.warning(
                     f"API request to {url} failed on attempt {i}",

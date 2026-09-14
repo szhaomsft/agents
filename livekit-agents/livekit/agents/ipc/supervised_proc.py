@@ -11,9 +11,11 @@ import sys
 import threading
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from dataclasses import dataclass
+from enum import Enum
 from multiprocessing.context import BaseContext
+from types import FrameType
 from typing import Any
 
 import psutil
@@ -25,33 +27,56 @@ from ..utils.aio import duplex_unix
 from . import channel, proto
 from .log_queue import LogQueueListener
 
+_mask_ctrl_c_refcount = 0
+_mask_ctrl_c_original: Callable[[int, FrameType | None], Any] | int | None = signal.SIG_DFL
+
+# how often the memory monitor samples the process RSS (seconds)
+_MEMORY_MONITOR_INTERVAL = 5.0
+# minimum delay between two "high memory usage" warnings for the same process, so a
+# process that sits above the threshold doesn't emit a warning on every sample
+_MEMORY_WARN_COOLDOWN = 120.0
+# re-emit the warning before the cooldown elapses if usage grew by at least this much
+# since the last warning (so a genuine leak still surfaces promptly)
+_MEMORY_WARN_RESET_DELTA_MB = 50.0
+
+
+class SupervisedProcKind(str, Enum):
+    JOB = "job"
+    INFERENCE = "inference"
+
+    def __str__(self) -> str:
+        return self.value
+
 
 @contextlib.contextmanager
 def _mask_ctrl_c() -> Generator[None, None, None]:
-    """
-    POSIX: block SIGINT on this thread (defer delivery).
-    Windows/others: temporarily ignore SIGINT (best available), then restore.
-    Keep the critical section *tiny* (just around Process.start()).
+    """Temporarily ignore SIGINT so forked/spawned children inherit SIG_IGN.
 
-    On Windows, signal.signal() can only be called from the main thread.
-    If we're not in the main thread, skip the signal masking entirely.
+    Unlike pthread_sigmask (per-thread), signal.signal is process-wide and
+    SIG_IGN is preserved across exec() per POSIX — so children start with
+    SIGINT ignored regardless of which thread performs the fork.
+
+    Uses refcounting so concurrent async callers (e.g. proc pool warming
+    multiple processes) don't clobber each other's saved handler.
+
+    signal.signal() can only be called from the main thread.
+    Keep the critical section *tiny* (just around Process.start()).
     """
-    if hasattr(signal, "pthread_sigmask"):  # POSIX
-        signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGINT])
-        try:
-            yield
-        finally:
-            signal.pthread_sigmask(signal.SIG_UNBLOCK, [signal.SIGINT])
-    elif threading.current_thread() is threading.main_thread():
-        # Windows: signal.signal() only works in the main thread
-        old = signal.signal(signal.SIGINT, signal.SIG_IGN)
-        try:
-            yield
-        finally:
-            signal.signal(signal.SIGINT, old)
-    else:
-        # Not in main thread on Windows, skip signal masking
+    global _mask_ctrl_c_refcount, _mask_ctrl_c_original
+
+    if threading.current_thread() is not threading.main_thread():
         yield
+        return
+
+    if _mask_ctrl_c_refcount == 0:
+        _mask_ctrl_c_original = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    _mask_ctrl_c_refcount += 1
+    try:
+        yield
+    finally:
+        _mask_ctrl_c_refcount -= 1
+        if _mask_ctrl_c_refcount == 0:
+            signal.signal(signal.SIGINT, _mask_ctrl_c_original)
 
 
 @dataclass
@@ -96,12 +121,22 @@ class SupervisedProc(ABC):
 
         self._exitcode: int | None = None
         self._pid: int | None = None
+        self._spawn_time: float | None = None
 
+        # memory monitoring state (see _memory_monitor_task)
+        self._memory_baseline_mb: float | None = None
+        self._last_memory_warn_time: float = 0.0
+        self._last_memory_warn_mb: float = 0.0
+        self._psutil_process: psutil.Process | None = None
+
+        self._start_atask: asyncio.Task[None] | None = None
         self._supervise_atask: asyncio.Task[None] | None = None
         self._closing = False
         self._kill_sent = False
         self._initialize_fut = asyncio.Future[None]()
         self._lock = asyncio.Lock()
+        self._shutdown_ack_fut = asyncio.Future[None]()
+        self._shutting_down_fut = asyncio.Future[None]()
 
     @abstractmethod
     def _create_process(self, cch: socket.socket, log_cch: socket.socket) -> mp.Process: ...
@@ -129,6 +164,17 @@ class SupervisedProc(ABC):
     def started(self) -> bool:
         return self._supervise_atask is not None
 
+    @property
+    @abstractmethod
+    def process_kind(self) -> SupervisedProcKind: ...
+
+    @property
+    def uptime(self) -> float:
+        """seconds since spawn, 0.0 if not started yet."""
+        if self._spawn_time is None:
+            return 0.0
+        return time.monotonic() - self._spawn_time
+
     async def start(self) -> None:
         """start the supervised process"""
         if self.started:
@@ -137,7 +183,9 @@ class SupervisedProc(ABC):
         if self._closing:
             raise RuntimeError("process is closed")
 
-        await asyncio.shield(self._start())
+        # keep a handle so aclose() can await an abandoned (cancelled) start()
+        self._start_atask = asyncio.create_task(self._start())
+        await asyncio.shield(self._start_atask)
 
     async def _start(self) -> None:
         def _add_proc_ctx_log(record: logging.LogRecord) -> None:
@@ -149,24 +197,44 @@ class SupervisedProc(ABC):
             mp_pch, mp_cch = socket.socketpair()
             mp_log_pch, mp_log_cch = socket.socketpair()
 
-            self._pch = await duplex_unix._AsyncDuplex.open(mp_pch)
+            sockets = (mp_pch, mp_cch, mp_log_pch, mp_log_cch)
+            pch: duplex_unix._AsyncDuplex | None = None
+            log_listener: LogQueueListener | None = None
+            try:
+                pch = await duplex_unix._AsyncDuplex.open(mp_pch)
+                self._pch = pch
 
-            log_pch = duplex_unix._Duplex.open(mp_log_pch)
-            log_listener = LogQueueListener(log_pch, _add_proc_ctx_log)
-            log_listener.start()
+                log_pch = duplex_unix._Duplex.open(mp_log_pch)
+                log_listener = LogQueueListener(log_pch, _add_proc_ctx_log)
+                log_listener.start()
 
-            self._proc = self._create_process(mp_cch, mp_log_cch)
+                self._proc = self._create_process(mp_cch, mp_log_cch)
 
-            # the signal handler isn't directly run when starting the process
-            # using pthread_sigmask to avoid annoying cancellation errors when pressing
-            # CTRL-C in bad timings
-            with _mask_ctrl_c():
-                await self._loop.run_in_executor(None, self._proc.start)
+                # Set SIG_IGN process-wide before forking so the child inherits it
+                # (SIG_IGN is preserved across exec per POSIX). This prevents
+                # KeyboardInterrupt during the child's bootstrap phase before
+                # it can install its own signal handlers.
+                with _mask_ctrl_c():
+                    await self._loop.run_in_executor(None, self._proc.start)
+            except Exception:
+                for s in sockets:
+                    with contextlib.suppress(OSError):
+                        s.close()
+
+                if pch is not None:
+                    with contextlib.suppress(duplex_unix.DuplexClosed):
+                        await pch.aclose()
+
+                if log_listener is not None:
+                    with contextlib.suppress(duplex_unix.DuplexClosed):
+                        log_listener.stop()
+                raise
 
             mp_log_cch.close()
             mp_cch.close()
 
             self._pid = self._proc.pid
+            self._spawn_time = time.monotonic()
             self._join_fut = asyncio.Future[None]()
 
             def _sync_run() -> None:
@@ -240,7 +308,16 @@ class SupervisedProc(ABC):
 
     async def aclose(self) -> None:
         """attempt to gracefully close the supervised process"""
+        if self._start_atask is not None and not self._start_atask.done():
+            # start() may have been cancelled mid-shield; wait so the started check can't race
+            await asyncio.wait([self._start_atask])
+
         if not self.started:
+            return
+
+        if not self._initialize_fut.done():
+            # never initialized: the child can't ack a graceful shutdown yet, kill it instead
+            await self.kill()
             return
 
         self._closing = True
@@ -248,17 +325,30 @@ class SupervisedProc(ABC):
             await channel.asend_message(self._pch, proto.ShutdownRequest())
 
         try:
-            if self._supervise_atask:
-                await asyncio.wait_for(
-                    asyncio.shield(self._supervise_atask), timeout=self._opts.close_timeout
-                )
+            await asyncio.wait_for(self._shutdown_ack_fut, timeout=self._opts.close_timeout)
         except asyncio.TimeoutError:
             logger.error(
-                "process did not exit in time, killing process",
+                "process did not ack shutdown in time, killing process",
                 extra=self.logging_extra(),
             )
             await self._send_dump_signal()
             await self._send_kill_signal()
+
+        if not self._shutting_down_fut.done():
+            await self._shutting_down_fut
+
+        if self._supervise_atask and not self._supervise_atask.done():
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(self._supervise_atask), timeout=self._opts.close_timeout
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    "process did not exit in time, killing process",
+                    extra=self.logging_extra(),
+                )
+                await self._send_dump_signal()
+                await self._send_kill_signal()
 
         async with self._lock:
             if self._supervise_atask:
@@ -270,6 +360,11 @@ class SupervisedProc(ABC):
             raise RuntimeError("process not started")
 
         self._closing = True
+        if not self._initialize_fut.done():
+            # unblock the supervise task waiting on this future
+            self._initialize_fut.set_exception(
+                RuntimeError("process killed before initialization completed")
+            )
         await self._send_dump_signal()
         await self._send_kill_signal()
 
@@ -343,7 +438,19 @@ class SupervisedProc(ABC):
         main_task = asyncio.create_task(self._main_task(ipc_ch))
         read_ipc_task = asyncio.create_task(self._read_ipc_task(ipc_ch, pong_timeout))
         ping_task = asyncio.create_task(self._ping_pong_task(pong_timeout))
-        read_ipc_task.add_done_callback(lambda _: ipc_ch.close())
+
+        def _on_read_ipc_done(_: asyncio.Task[None]) -> None:
+            ipc_ch.close()
+            # the read task is the sole reader of the IPC channel; once it ends, the
+            # process is gone (channel closed) or being torn down (cancelled). resolve
+            # the shutdown futures here so aclose() never waits the full close_timeout
+            # for an ack that can't arrive.
+            if not self._shutdown_ack_fut.done():
+                self._shutdown_ack_fut.set_result(None)
+            if not self._shutting_down_fut.done():
+                self._shutting_down_fut.set_result(None)
+
+        read_ipc_task.add_done_callback(_on_read_ipc_done)
 
         memory_monitor_task: asyncio.Task[None] | None = None
         if self._opts.memory_limit_mb > 0 or self._opts.memory_warn_mb > 0:
@@ -387,6 +494,14 @@ class SupervisedProc(ABC):
                 with contextlib.suppress(aio.SleepFinished):
                     pong_timeout.reset()
 
+            if isinstance(msg, proto.ShutdownRequestAck):
+                if not self._shutdown_ack_fut.done():
+                    self._shutdown_ack_fut.set_result(None)
+
+            if isinstance(msg, proto.ShuttingDown):
+                if not self._shutting_down_fut.done():
+                    self._shutting_down_fut.set_result(None)
+
             if isinstance(msg, proto.Exiting):
                 logger.info(
                     "process exiting",
@@ -422,50 +537,118 @@ class SupervisedProc(ABC):
         finally:
             await aio.cancel_and_wait(*tasks)
 
+    def _should_emit_memory_warning(self, memory_mb: float, *, now: float) -> bool:
+        """True (and records the emission) if the cooldown elapsed or usage grew
+        by _MEMORY_WARN_RESET_DELTA_MB since the last warning."""
+        cooled_down = now - self._last_memory_warn_time >= _MEMORY_WARN_COOLDOWN
+        grew = memory_mb - self._last_memory_warn_mb >= _MEMORY_WARN_RESET_DELTA_MB
+        if cooled_down or grew:
+            self._last_memory_warn_time = now
+            self._last_memory_warn_mb = memory_mb
+            return True
+        return False
+
+    def _memory_logging_extra(self, memory_mb: float, memory_metric: str) -> dict[str, Any]:
+        """Diagnostic context for the memory logs: tells a process that started
+        heavy from one that grew over time (uptime, baseline, growth). memory_metric
+        records which footprint metric the number reflects (pss/uss/rss)."""
+        extra: dict[str, Any] = {
+            "memory_usage_mb": round(memory_mb, 1),
+            "memory_metric": memory_metric,
+            "memory_warn_mb": self._opts.memory_warn_mb,
+            "memory_limit_mb": self._opts.memory_limit_mb,
+            "uptime": round(self.uptime, 1),
+            # _running_job only exists on the job executor subclass, not the inference one
+            "has_running_job": getattr(self, "_running_job", None) is not None,
+        }
+        if self._memory_baseline_mb is not None:
+            extra["baseline_memory_mb"] = round(self._memory_baseline_mb, 1)
+            extra["growth_memory_mb"] = round(memory_mb - self._memory_baseline_mb, 1)
+        extra.update(self.logging_extra())
+        return extra
+
+    def _sample_memory_mb(self) -> tuple[float, str]:
+        """Real footprint of the process, preferring metrics that don't
+        double-count shared pages. RSS counts copy-on-write pages inherited
+        from the forkserver and file-backed library pages at memory_info weight, so it
+        overstates what the process actually consumes and oversums across
+        processes. PSS (proportional, Linux only) divides shared pages among
+        their sharers and sums correctly to physical use; USS (private only) is
+        the cross-platform fallback since psutil exposes no PSS on macOS/Windows.
+        RSS is a last resort if the extended metrics are unavailable.
+
+        Synchronous and blocking: the PSS/USS path walks the target process's
+        page tables in the kernel, which scales with its mapping count and is
+        ~ms for a large child. Run via run_in_executor so that walk overlaps
+        with the event loop rather than stalling it (the read syscall releases
+        the GIL, so the offload pays off even on a single core)."""
+        process = self._psutil_process
+        if process is None:
+            process = self._psutil_process = psutil.Process(self._pid)
+
+        try:
+            memory_info: Any = process.memory_full_info()
+        except (psutil.AccessDenied, NotImplementedError):
+            memory_info = process.memory_info()
+
+        for metric in "pss", "uss", "rss":
+            if memory_bytes := getattr(memory_info, metric, 0):
+                return memory_bytes / (1024 * 1024), metric
+
+        return 0, "unknown"
+
     @log_exceptions(logger=logger)
     async def _memory_monitor_task(self) -> None:
         """Monitor memory usage and kill the process if it exceeds the limit."""
         while not self._closing and not self._kill_sent:
             try:
                 if not self._pid:
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(_MEMORY_MONITOR_INTERVAL)
                     continue
 
-                # get process memory info
-                process = psutil.Process(self._pid)
-                memory_info = process.memory_info()
-                memory_mb = memory_info.rss / (1024 * 1024)  # Convert to MB
+                memory_mb, memory_metric = await self._loop.run_in_executor(
+                    None, self._sample_memory_mb
+                )
+
+                # the first sample (taken shortly after initialization) is treated as the
+                # post-prewarm baseline, so later samples can report growth since startup
+                if self._memory_baseline_mb is None:
+                    self._memory_baseline_mb = memory_mb
 
                 if self._opts.memory_limit_mb > 0 and memory_mb > self._opts.memory_limit_mb:
                     logger.error(
-                        "process exceeded memory limit, killing process",
-                        extra={
-                            "memory_usage_mb": memory_mb,
-                            "memory_limit_mb": self._opts.memory_limit_mb,
-                            **self.logging_extra(),
-                        },
+                        f"{self.process_kind} process exceeded memory limit, killing it",
+                        extra=self._memory_logging_extra(memory_mb, memory_metric),
                     )
                     await self._send_dump_signal()
                     await self._send_kill_signal()
                 elif self._opts.memory_warn_mb > 0 and memory_mb > self._opts.memory_warn_mb:
-                    logger.warning(
-                        "process memory usage is high",
-                        extra={
-                            "memory_usage_mb": memory_mb,
-                            "memory_warn_mb": self._opts.memory_warn_mb,
-                            "memory_limit_mb": self._opts.memory_limit_mb,
-                            **self.logging_extra(),
-                        },
-                    )
+                    # rate-limit the warning: a process that lingers above the threshold
+                    # would otherwise emit a warning on every sample (every few seconds).
+                    # still re-emit early if usage jumped noticeably since the last warning.
+                    if self._should_emit_memory_warning(memory_mb, now=time.monotonic()):
+                        # when no hard limit is configured the warning is purely advisory:
+                        # nothing is terminated, so say so to avoid alarming operators.
+                        advisory = self._opts.memory_limit_mb <= 0
+                        logger.warning(
+                            f"{self.process_kind} process memory usage is above the"
+                            " warning threshold"
+                            + (
+                                " (advisory only, the process will not be terminated)"
+                                if advisory
+                                else ""
+                            ),
+                            extra=self._memory_logging_extra(memory_mb, memory_metric),
+                        )
 
             except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
                 if self._closing or self._kill_sent:
                     return
 
                 logger.warning(
-                    "Failed to get memory info for process",
+                    "failed to get memory info for process: %s",
+                    e,
                     extra=self.logging_extra(),
-                    exc_info=e,
                 )
                 # don't bother rechecking if we cannot get process info
                 return
@@ -478,7 +661,7 @@ class SupervisedProc(ABC):
                     extra=self.logging_extra(),
                 )
 
-            await asyncio.sleep(5)  # check every 5 seconds
+            await asyncio.sleep(_MEMORY_MONITOR_INTERVAL)
 
     def logging_extra(self) -> dict[str, Any]:
         extra: dict[str, Any] = {

@@ -8,7 +8,7 @@ dynamic = ["version"]
 description = "LiveKit Agents Plugin for services from AWS"
 readme = "README.md"
 license = "Apache-2.0"
-requires-python = ">=3.9.0"
+requires-python = ">=3.10.0"
 authors = [{ name = "LiveKit", email = "hello@livekit.io" }]
 keywords = ["aws", "nova", "sonic", "voice", "ai", "realtime", "audio", "video", "livekit"]
 classifiers = [
@@ -18,20 +18,25 @@ classifiers = [
     "Topic :: Multimedia :: Video",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3 :: Only",
 ]
 dependencies = [
-    "livekit-agents>=1.3.11",
-    "aioboto3>=14.1.0",
-    "aws_sdk_transcribe_streaming>=0.2.0; python_version >= '3.12'",
+    "livekit-agents>=1.8.1",
+    "aiobotocore>=3.0.0",
+    # StartStreamTranscription is bidirectional, which only the CRT transport provides;
+    # transcribe-streaming 0.11 dropped it from its own base dependencies.
+    "aws_sdk_transcribe_streaming>=0.11.0; python_version >= '3.12'",
+    "smithy-http[awscrt]; python_version >= '3.12'",
 ]
 
 [project.optional-dependencies]
 realtime = [
     "aws-sdk-bedrock-runtime>=0.2.0; python_version >= '3.12'",
+    # Sonic needs duplex streaming, which only the CRT transport provides; bedrock-runtime
+    # 0.11 dropped it from its own base dependencies.
+    "smithy-http[awscrt]; python_version >= '3.12'",
     "aws-sdk-signers>=0.0.3; python_version >= '3.12'",
     "boto3>1.35.10",
 ]
@@ -49,3 +54,7 @@ packages = ["livekit"]
 
 [tool.hatch.build.targets.sdist]
 include = ["/livekit"]
+
+[tool.uv]
+exclude-newer = "7 days"
+exclude-newer-package = { livekit-agents = "0 days" }
