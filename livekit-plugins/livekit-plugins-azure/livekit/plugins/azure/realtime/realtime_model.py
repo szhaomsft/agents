@@ -220,7 +220,8 @@ class RealtimeModel(llm.RealtimeModel):
     def provider(self) -> str:
         return "azure-voicelive"
 
-    def session(self) -> RealtimeSession:
+    def session(self, *, turn_detection_disabled: bool = False) -> RealtimeSession:
+        # Disabling server-side turn detection is unsupported (can_disable_turn_detection=False).
         sess = RealtimeSession(self)
         self._sessions.add(sess)
         return sess
@@ -837,12 +838,20 @@ class RealtimeSession(
         self,
         *,
         instructions: NotGivenOr[str] = NOT_GIVEN,
+        tool_choice: NotGivenOr[llm.ToolChoice] = NOT_GIVEN,
+        tools: NotGivenOr[list[llm.Tool]] = NOT_GIVEN,
     ) -> asyncio.Future[llm.GenerationCreatedEvent]:
         """Generate a reply from the model.
 
         Returns a Future that resolves to GenerationCreatedEvent when the response.created
         event is received from Azure with matching client_event_id.
         """
+        if is_given(tool_choice) or is_given(tools):
+            logger.warning(
+                "per-response tools and tool choice are not supported by Azure Voice Live; "
+                "use update_tools() and update_options() instead"
+            )
+
         # Generate unique event ID to track this response
         event_id = utils.shortuuid("response_create_")
         fut = asyncio.Future[llm.GenerationCreatedEvent]()
