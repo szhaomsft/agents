@@ -156,6 +156,7 @@ class ConsoleAudioOutput(io.AudioOutput):
 
         self._output_buf = bytearray()
         self._audio_lock = threading.Lock()
+        self._playback_end_at: float = 0.0
         self._output_buf_empty = asyncio.Event()
         self._output_buf_empty.set()
         self._interrupted_ev = asyncio.Event()
@@ -179,7 +180,17 @@ class ConsoleAudioOutput(io.AudioOutput):
         return self._paused_at is not None
 
     def mark_output_empty(self) -> None:
-        self._output_buf_empty.set()
+        with self._audio_lock:
+            if not self._output_buf:
+                self._output_buf_empty.set()
+
+    def _mark_device_audio(self, samples: int, output_delay: float) -> None:
+        """Record the last real sample's device deadline while holding audio_lock."""
+        if samples:
+            self._playback_end_at = max(
+                self._playback_end_at,
+                time.monotonic() + max(0.0, output_delay) + samples / SAMPLE_RATE,
+            )
 
     async def capture_frame(self, frame: rtc.AudioFrame) -> None:
         await super().capture_frame(frame)
@@ -207,12 +218,22 @@ class ConsoleAudioOutput(io.AudioOutput):
 
     def clear_buffer(self) -> None:
         with self._audio_lock:
+            buffered_duration = len(self._output_buf) / (2 * SAMPLE_RATE)
+            device_duration = max(0.0, self._playback_end_at - time.monotonic())
             self._output_buf.clear()
+            self._playback_end_at = 0.0
             self._output_buf_empty.set()
             # redundant (_wait_for_playout does the same, albeit async) but defensive
             self._segment_id += 1
             self._playback_started_fired = False
 
+        logger.debug(
+            "console audio buffer cleared",
+            extra={
+                "buffered_duration": buffered_duration,
+                "device_pending_duration": device_duration,
+            },
+        )
         if self._pushed_duration:
             self._interrupted_ev.set()
 
@@ -221,6 +242,12 @@ class ConsoleAudioOutput(io.AudioOutput):
 
         if self._paused_at is None:
             self._paused_at = time.monotonic()
+            with self._audio_lock:
+                buffered_duration = len(self._output_buf) / (2 * SAMPLE_RATE)
+            logger.debug(
+                "console audio playback paused",
+                extra={"buffered_duration": buffered_duration},
+            )
 
     def resume(self) -> None:
         super().resume()
@@ -228,12 +255,24 @@ class ConsoleAudioOutput(io.AudioOutput):
         if self._paused_at is not None:
             self._paused_duration += time.monotonic() - self._paused_at
             self._paused_at = None
+            logger.debug("console audio playback resumed")
 
     async def _wait_for_playout(self) -> None:
         async def _wait_buffered_audio() -> None:
-            while len(self._output_buf) > 0:
-                await self._output_buf_empty.wait()
-                await asyncio.sleep(0)
+            while True:
+                with self._audio_lock:
+                    buffered = bool(self._output_buf)
+                    if buffered:
+                        self._output_buf_empty.clear()
+                    device_delay = self._playback_end_at - time.monotonic()
+                if buffered:
+                    await self._output_buf_empty.wait()
+                elif device_delay > 0:
+                    # An empty Python buffer only means PortAudio has received
+                    # the samples, not that the DAC has finished playing them.
+                    await asyncio.sleep(device_delay)
+                else:
+                    return
 
         wait_for_interruption = asyncio.create_task(self._interrupted_ev.wait())
         wait_for_playout = asyncio.create_task(_wait_buffered_audio())
@@ -244,8 +283,7 @@ class ConsoleAudioOutput(io.AudioOutput):
             )
             interrupted = wait_for_interruption.done()
         finally:
-            wait_for_playout.cancel()
-            wait_for_interruption.cancel()
+            await aio.cancel_and_wait(wait_for_playout, wait_for_interruption)
 
         if self._paused_at is not None:
             self._paused_duration += time.monotonic() - self._paused_at
@@ -257,6 +295,14 @@ class ConsoleAudioOutput(io.AudioOutput):
         else:
             played_duration = self._pushed_duration
 
+        logger.debug(
+            "console audio playback finished",
+            extra={
+                "pushed_duration": self._pushed_duration,
+                "played_duration": played_duration,
+                "interrupted": interrupted,
+            },
+        )
         self.on_playback_finished(playback_position=played_duration, interrupted=interrupted)
 
         self._pushed_duration = 0.0
@@ -264,6 +310,7 @@ class ConsoleAudioOutput(io.AudioOutput):
         self._paused_duration = 0.0
         self._interrupted_ev.clear()
         with self._audio_lock:
+            self._playback_end_at = 0.0
             self._output_buf_empty.set()
             self._playback_started_fired = False
             self._segment_id += 1
@@ -599,8 +646,12 @@ class AgentsConsole:
 
     def set_speaker_enabled(self, enable: bool, *, device: int | str | None = None) -> None:
         if self._output_stream:
-            self._output_stream.close()
+            output_stream = self._output_stream
             self._output_stream = self._output_name = None
+            try:
+                output_stream.stop()
+            finally:
+                output_stream.close()
 
         if not enable:
             return
@@ -742,6 +793,9 @@ class AgentsConsole:
                     available_bytes = len(self._io_audio_output.audio_buffer)
                     if available_bytes > 0:
                         self._io_audio_output._maybe_mark_playback_started()
+                        self._io_audio_output._mark_device_audio(
+                            available_bytes // 2, self._output_delay
+                        )
                     outdata[: available_bytes // 2, 0] = np.frombuffer(
                         self._io_audio_output.audio_buffer,
                         dtype=np.int16,
@@ -752,9 +806,12 @@ class AgentsConsole:
                     self.io_loop.call_soon_threadsafe(self._io_audio_output.mark_output_empty)
                 else:
                     self._io_audio_output._maybe_mark_playback_started()
+                    self._io_audio_output._mark_device_audio(frames, self._output_delay)
                     chunk = self._io_audio_output.audio_buffer[:bytes_needed]
                     outdata[:, 0] = np.frombuffer(chunk, dtype=np.int16, count=frames)
                     del self._io_audio_output.audio_buffer[:bytes_needed]
+                    if not self._io_audio_output.audio_buffer:
+                        self.io_loop.call_soon_threadsafe(self._io_audio_output.mark_output_empty)
 
         num_chunks = frames // FRAME_SAMPLES
         for i in range(num_chunks):

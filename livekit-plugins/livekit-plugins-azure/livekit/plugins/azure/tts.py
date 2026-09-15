@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import os
 import queue
+import threading
 import weakref
 from dataclasses import dataclass, replace
 from typing import Literal
@@ -219,9 +220,10 @@ class TTS(tts.TTS):
             auth_token=speech_auth_token,
         )
         self._streams = weakref.WeakSet[SynthesizeStream]()
-        # Shared synthesizer and warmup state across all streams
-        self._synthesizer: speechsdk.SpeechSynthesizer | None = None
-        self._warmup_done = False
+        self._prewarmed: (
+            tuple[_TTSOptions, speechsdk.SpeechSynthesizer, speechsdk.Connection] | None
+        ) = None
+        self._closed = False
 
     @property
     def model(self) -> str:
@@ -284,7 +286,64 @@ class TTS(tts.TTS):
         self._streams.add(stream)
         return stream
 
+    def prewarm(self) -> None:
+        """Open an idle SDK connection without synthesizing dummy speech."""
+        if self._closed:
+            return
+        if self._prewarmed is not None:
+            if self._prewarmed[0] == self._opts:
+                return
+            self._prewarmed[2].close()
+            self._prewarmed = None
+        self._prewarmed = self._open_synthesizer(self._opts)
+
+    def _open_synthesizer(
+        self, opts: _TTSOptions
+    ) -> tuple[_TTSOptions, speechsdk.SpeechSynthesizer, speechsdk.Connection]:
+        synthesizer = self._create_synthesizer(opts)
+        connection = speechsdk.Connection.from_speech_synthesizer(synthesizer)
+        # SDK open() starts connection establishment without waiting for it.
+        connection.open(True)
+        return replace(opts), synthesizer, connection
+
+    def _take_synthesizer(
+        self, opts: _TTSOptions
+    ) -> tuple[_TTSOptions, speechsdk.SpeechSynthesizer, speechsdk.Connection]:
+        warmed, self._prewarmed = self._prewarmed, None
+        if warmed is not None:
+            if warmed[0] == opts:
+                return warmed
+            warmed[2].close()
+        return self._open_synthesizer(opts)
+
+    def _create_synthesizer(self, opts: _TTSOptions) -> speechsdk.SpeechSynthesizer:
+        if opts.speech_endpoint:
+            endpoint = opts.speech_endpoint.replace(
+                "/cognitiveservices/v1", "/cognitiveservices/websocket/v2"
+            )
+        else:
+            endpoint = f"wss://{opts.region}.tts.speech.microsoft.com/cognitiveservices/websocket/v2"
+
+        speech_config = speechsdk.SpeechConfig(
+            endpoint=endpoint,
+            subscription=opts.subscription_key or "",
+        )
+        if opts.deployment_id:
+            speech_config.endpoint_id = opts.deployment_id
+        speech_config.speech_synthesis_voice_name = opts.voice
+        speech_config.set_speech_synthesis_output_format(
+            SDK_OUTPUT_FORMATS.get(
+                opts.sample_rate,
+                speechsdk.SpeechSynthesisOutputFormat.Raw24Khz16BitMonoPcm,
+            )
+        )
+        return speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=None)
+
     async def aclose(self) -> None:
+        self._closed = True
+        if self._prewarmed is not None:
+            self._prewarmed[2].close()
+            self._prewarmed = None
         for stream in list(self._streams):
             await stream.aclose()
         self._streams.clear()
@@ -379,87 +438,30 @@ class SynthesizeStream(tts.SynthesizeStream):
         super().__init__(tts=tts, conn_options=conn_options)
         self._tts: TTS = tts
         self._opts = replace(tts._opts)
-        self._text_ch = utils.aio.Chan[str]()
-        # Use shared synthesizer from TTS instance
-        if self._tts._synthesizer is None:
-            self._tts._synthesizer = self._create_synthesizer()
-            # Warm up only once
-            self._warmup_synthesizer()
+        self._text_ch = utils.aio.Chan[str | None]()
+        # SDK events and stop_speaking_async apply to the entire synthesizer.
+        # Each stream needs its own instance to isolate overlapping requests.
+        self._connection: speechsdk.Connection | None = None
+        self._synthesizer = self._create_synthesizer()
+
+    async def aclose(self) -> None:
+        await super().aclose()
+        if self._connection is not None:
+            self._connection.close()
+            self._connection = None
+            # Warm the next request while the current response is playing.
+            self._tts.prewarm()
 
     def _recreate_synthesizer(self) -> None:
         """Recreate the synthesizer after connection issues."""
         logger.info("recreating azure tts synthesizer after connection error")
-        try:
-            if self._tts._synthesizer:
-                # Clean up old synthesizer
-                del self._tts._synthesizer
-        except:
-            pass
-        self._tts._synthesizer = self._create_synthesizer()
-        self._tts._warmup_done = False
-        self._warmup_synthesizer()
-
+        if self._connection is not None:
+            self._connection.close()
+        self._synthesizer = self._create_synthesizer()
 
     def _create_synthesizer(self) -> speechsdk.SpeechSynthesizer:
-        """Create and configure the Azure Speech synthesizer."""
-        # Build WebSocket v2 endpoint
-        if self._opts.speech_endpoint:
-            endpoint = self._opts.speech_endpoint.replace(
-                "/cognitiveservices/v1", "/cognitiveservices/websocket/v2"
-            )
-        else:
-            endpoint = f"wss://{self._opts.region}.tts.speech.microsoft.com/cognitiveservices/websocket/v2"
-
-        # Create speech config
-        speech_config = speechsdk.SpeechConfig(
-            endpoint=endpoint,
-            subscription=self._opts.subscription_key or "",
-        )
-
-        # Set deployment ID if provided
-        if self._opts.deployment_id:
-            speech_config.endpoint_id = self._opts.deployment_id
-
-        # Set voice and output format
-        speech_config.speech_synthesis_voice_name = self._opts.voice
-        
-        # Use SDK format if available
-        if self._opts.sample_rate in SDK_OUTPUT_FORMATS:
-            speech_config.set_speech_synthesis_output_format(
-                SDK_OUTPUT_FORMATS[self._opts.sample_rate]
-            )
-        else:
-            # Default to 24kHz raw format
-            speech_config.set_speech_synthesis_output_format(
-                speechsdk.SpeechSynthesisOutputFormat.Raw24Khz16BitMonoPcm
-            )
-
-        # Create synthesizer (no audio config - we'll use events)
-        return speechsdk.SpeechSynthesizer(
-            speech_config=speech_config, audio_config=None
-        )
-
-    def _warmup_synthesizer(self) -> None:
-        """Warm up the synthesizer by synthesizing a short text."""
-        if self._tts._warmup_done:
-            return
-
-        import time
-
-        # Warm-up: synthesize a short text first to establish connection
-        logger.info("warming up azure tts synthesizer")
-        warmup_start = time.time()
-        warmup_request = speechsdk.SpeechSynthesisRequest(
-            input_type=speechsdk.SpeechSynthesisRequestInputType.TextStream
-        )
-        warmup_task = self._tts._synthesizer.speak_async(warmup_request)
-        warmup_request.input_stream.write("Warm up.")
-        warmup_request.input_stream.close()
-        warmup_result = warmup_task.get()
-        warmup_time = time.time() - warmup_start
-        logger.info("azure tts warmup completed", extra={"duration": f"{warmup_time:.3f}s"})
-
-        self._tts._warmup_done = True
+        _, synthesizer, self._connection = self._tts._take_synthesizer(self._opts)
+        return synthesizer
 
     async def _run(self, output_emitter: tts.AudioEmitter) -> None:
         request_id = utils.shortuuid()
@@ -532,26 +534,22 @@ class SynthesizeStream(tts.SynthesizeStream):
 
         # Get the event loop before entering the thread
         loop = asyncio.get_event_loop()
+        synthesizer = self._synthesizer
 
         def _run_sdk_synthesis() -> None:
-            """Run Azure SDK synthesis in sync mode with streaming callbacks."""            
+            """Run Azure SDK synthesis in sync mode with streaming callbacks."""
+            callback_lock = threading.Lock()
+            callback_audio = bytearray()
+            accepting_audio = True
+
             def synthesizing_callback(evt):
                 """Called when audio chunks are available during synthesis."""
-                import time
-                if cancelled[0]:
-                    return  # Discard audio if cancelled
-                if evt.result.audio_data:
-                    # Raw PCM format - no headers to strip
-                    audio_chunk = evt.result.audio_data
-
-                    # print(f"  [SDK Callback {time.time():.3f}] Received audio chunk: {len(audio_chunk)} bytes")
-                    # Send audio to async queue (thread-safe)
-                    asyncio.run_coroutine_threadsafe(audio_queue.put(audio_chunk), loop)
-
-            def completed_callback(evt):
-                """Called when synthesis completes successfully."""
-                # Signal completion with None
-                asyncio.run_coroutine_threadsafe(audio_queue.put(None), loop)
+                with callback_lock:
+                    if cancelled[0] or not accepting_audio:
+                        return
+                    if audio_chunk := evt.result.audio_data:
+                        callback_audio.extend(audio_chunk)
+                        loop.call_soon_threadsafe(audio_queue.put_nowait, audio_chunk)
 
             def canceled_callback(evt):
                 """Called when synthesis is canceled or fails."""
@@ -561,22 +559,17 @@ class SynthesizeStream(tts.SynthesizeStream):
                     f"Error: {cancellation.error_details}"
                 )
                 synthesis_error.append(error)
-                # Signal error completion
-                asyncio.run_coroutine_threadsafe(audio_queue.put(None), loop)
 
             # Connect event handlers
-            self._tts._synthesizer.synthesizing.connect(synthesizing_callback)
-            self._tts._synthesizer.synthesis_completed.connect(completed_callback)
-            self._tts._synthesizer.synthesis_canceled.connect(canceled_callback)
-
-            # Create streaming request
-            tts_request = speechsdk.SpeechSynthesisRequest(
-                input_type=speechsdk.SpeechSynthesisRequestInputType.TextStream
-            )
+            synthesizer.synthesizing.connect(synthesizing_callback)
+            synthesizer.synthesis_canceled.connect(canceled_callback)
 
             try:
+                tts_request = speechsdk.SpeechSynthesisRequest(
+                    input_type=speechsdk.SpeechSynthesisRequestInputType.TextStream
+                )
                 # Start synthesis (returns result future)
-                result_future = self._tts._synthesizer.speak_async(tts_request)
+                result_future = synthesizer.speak_async(tts_request)
 
                 # Stream text pieces as they arrive from the queue
                 chunk_count = [0]
@@ -597,17 +590,39 @@ class SynthesizeStream(tts.SynthesizeStream):
                 # Close input stream to signal completion
                 tts_request.input_stream.close()
                 
-                # Wait for synthesis to complete
-                # This blocks until the SDK finishes and callbacks fire
+                # Wait for the complete result, not just the completion event.
                 result = result_future.get()
-                
-                # Ensure completion signal is sent
-                if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
-                    asyncio.run_coroutine_threadsafe(audio_queue.put(None), loop)
-                
+                if (
+                    result.reason != speechsdk.ResultReason.SynthesizingAudioCompleted
+                    and not synthesis_error
+                ):
+                    raise APIConnectionError(f"Azure TTS synthesis did not complete: {result.reason}")
+                with callback_lock:
+                    # SDK completion can precede the final audio callbacks.
+                    # Freeze delivery before reconciling with the complete PCM
+                    # result, so a late callback cannot duplicate the tail.
+                    accepting_audio = False
+                    if not cancelled[0] and not synthesis_error:
+                        result_audio = result.audio_data
+                        if not result_audio.startswith(callback_audio):
+                            raise APIConnectionError(
+                                "Azure TTS callback audio differs from the final synthesis result"
+                            )
+                        if tail := result_audio[len(callback_audio) :]:
+                            loop.call_soon_threadsafe(audio_queue.put_nowait, tail)
+                            logger.debug(
+                                "azure tts forwarded final audio from SDK result",
+                                extra={"tail_bytes": len(tail)},
+                            )
             except Exception as e:
                 synthesis_error.append(e)
-                asyncio.run_coroutine_threadsafe(audio_queue.put(None), loop)
+            finally:
+                with callback_lock:
+                    accepting_audio = False
+                synthesizer.synthesizing.disconnect_all()
+                synthesizer.synthesis_canceled.disconnect_all()
+                # Only the finished SDK request may end this stream's audio.
+                loop.call_soon_threadsafe(audio_queue.put_nowait, None)
 
         async def _stream_text_input() -> None:
             """Stream text chunks to the SDK as they arrive."""
@@ -646,6 +661,7 @@ class SynthesizeStream(tts.SynthesizeStream):
                         output_emitter.push(audio_chunk)
             except asyncio.CancelledError:
                 cancelled[0] = True
+                text_queue.put(None)
                 raise
 
         try:
@@ -675,8 +691,8 @@ class SynthesizeStream(tts.SynthesizeStream):
             # Stop the Azure synthesizer to terminate ongoing synthesis
             # This only stops the current operation, synthesizer can be reused
             try:
-                if self._tts._synthesizer:
-                    stop_future = self._tts._synthesizer.stop_speaking_async()
+                if synthesizer:
+                    stop_future = synthesizer.stop_speaking_async()
                     # Wait for stop to complete (with timeout to avoid hanging)
                     await asyncio.wait_for(
                         loop.run_in_executor(None, stop_future.get),
