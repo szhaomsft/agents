@@ -28,6 +28,8 @@ class _ConsoleHarness:
         # Scope the clock replacement to this module, not Python's time module.
         # Virtual-time tests can then drive the device deadline deterministically.
         monkeypatch.setattr(_legacy, "time", SimpleNamespace(monotonic=self.loop.time))
+        # Keep device-deadline cases independent of the initial prebuffer.
+        monkeypatch.setattr(_legacy, "PREBUFFER_DURATION", 0)
         self.output = _legacy.ConsoleAudioOutput(self.loop)
         self.console = _legacy.AgentsConsole.__new__(_legacy.AgentsConsole)
         self.console._lock = threading.Lock()
@@ -94,7 +96,7 @@ async def test_completion_waits_for_final_sample_on_device(
 
     assert np.all(rendered[:samples] == 1)
     assert np.all(rendered[samples:] == 0)
-    assert not console.output.audio_buffer
+    assert not console.output._output_buf
     duration = 0.125 + samples / RATE
     await asyncio.sleep(duration - 0.001)
     assert not playout.done(), "empty Python buffer was mistaken for finished device playback"
@@ -160,7 +162,7 @@ async def test_pause_preserves_pending_tail_until_resume(console: _ConsoleHarnes
 
     await asyncio.sleep(0.2)
     assert np.all(console.render() == 0)
-    assert len(console.output.audio_buffer) == 777 * 2
+    assert len(console.output._output_buf) == 777 * 2
     assert not playout.done()
 
     console.output.resume()
@@ -187,7 +189,7 @@ async def test_interruption_does_not_wait_for_device_deadline(
     event = await asyncio.wait_for(playout, timeout=1)
     assert console.loop.time() - started < 0.001
     assert event.interrupted
-    assert not console.output.audio_buffer
+    assert not console.output._output_buf
     assert console.output._playback_end_at == 0
 
     # A retired segment's device deadline must not delay a subsequent segment.
@@ -247,3 +249,22 @@ async def test_speaker_shutdown_still_closes_after_stop_failure(console: _Consol
 async def test_empty_flush_does_not_start_playout_waiter(console: _ConsoleHarness) -> None:
     console.output.flush()
     assert console.output._flush_task is None
+
+
+async def test_prebuffered_tail_waits_for_device(
+    console: _ConsoleHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(_legacy, "PREBUFFER_DURATION", 0.3)
+    await console.push(777)
+    assert np.all(console.render(delay=10) == 0)
+    assert console.output._playback_end_at == 0
+    assert len(console.output._output_buf) == 777 * 2
+
+    console.output.flush()
+    started = console.loop.time()
+    rendered = console.render()
+    assert np.all(rendered[:777] == 1)
+    assert np.all(rendered[777:] == 0)
+    event = await asyncio.wait_for(console.wait_for_playout(), timeout=1)
+    assert console.loop.time() - started == pytest.approx(0.125 + 777 / RATE, abs=1e-5)
+    assert not event.interrupted

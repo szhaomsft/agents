@@ -114,6 +114,10 @@ class _ExitCli(SystemExit):
 ConsoleMode = Literal["text", "audio"]
 
 SAMPLE_RATE = 24000
+# a duplex model streams at real-time pace, so the speaker needs this much margin against
+# network jitter before the head of a segment is played; the default is the largest arrival
+# gap observed with GPT-Live rounded up to whole callbacks
+PREBUFFER_DURATION = 0.3
 
 
 class ConsoleAudioInput(io.AudioInput):
@@ -157,6 +161,8 @@ class ConsoleAudioOutput(io.AudioOutput):
         self._output_buf = bytearray()
         self._audio_lock = threading.Lock()
         self._playback_end_at: float = 0.0
+        # true from the first frame of a segment until PREBUFFER_DURATION is queued or flushed
+        self._priming = False
         self._output_buf_empty = asyncio.Event()
         self._output_buf_empty.set()
         self._interrupted_ev = asyncio.Event()
@@ -166,14 +172,6 @@ class ConsoleAudioOutput(io.AudioOutput):
 
         # track the segment id to avoid stale async operations
         self._segment_id = 0
-
-    @property
-    def audio_lock(self) -> threading.Lock:
-        return self._audio_lock
-
-    @property
-    def audio_buffer(self) -> bytearray:
-        return self._output_buf
 
     @property
     def paused(self) -> bool:
@@ -199,16 +197,20 @@ class ConsoleAudioOutput(io.AudioOutput):
             logger.error("capture_frame called while previous flush is in progress")
             await self._flush_task
 
-        if not self._pushed_duration:
-            self._capture_start = time.monotonic()
-
-        self._pushed_duration += frame.duration
         with self._audio_lock:
+            if not self._pushed_duration:
+                self._capture_start = time.monotonic()
+                self._priming = True
+
+            self._pushed_duration += frame.duration
             self._output_buf += frame.data  # TODO: optimize
             self._output_buf_empty.clear()
 
     def flush(self) -> None:
         super().flush()
+        with self._audio_lock:
+            self._priming = False
+
         if self._pushed_duration:
             if self._flush_task and not self._flush_task.done():
                 logger.error("flush called while previous flush is in progress")
@@ -223,6 +225,7 @@ class ConsoleAudioOutput(io.AudioOutput):
             self._output_buf.clear()
             self._playback_end_at = 0.0
             self._output_buf_empty.set()
+            self._priming = False
             # redundant (_wait_for_playout does the same, albeit async) but defensive
             self._segment_id += 1
             self._playback_started_fired = False
@@ -314,6 +317,40 @@ class ConsoleAudioOutput(io.AudioOutput):
             self._output_buf_empty.set()
             self._playback_started_fired = False
             self._segment_id += 1
+
+    def read_into(self, outdata: np.ndarray, frames: int, *, output_delay: float = 0.0) -> None:
+        """Fill ``outdata`` with the next ``frames`` samples of playback. Called from the audio thread."""
+        with self._audio_lock:
+            if self._priming and len(self._output_buf) < int(PREBUFFER_DURATION * SAMPLE_RATE) * 2:
+                outdata[:] = 0
+                return
+
+            self._priming = False
+            if self.paused:
+                outdata[:] = 0
+            else:
+                bytes_needed = frames * 2
+                if len(self._output_buf) < bytes_needed:
+                    available_bytes = len(self._output_buf)
+                    if available_bytes > 0:
+                        self._maybe_mark_playback_started()
+                        self._mark_device_audio(available_bytes // 2, output_delay)
+                    outdata[: available_bytes // 2, 0] = np.frombuffer(
+                        self._output_buf,
+                        dtype=np.int16,
+                        count=available_bytes // 2,
+                    )
+                    outdata[available_bytes // 2 :, 0] = 0
+                    del self._output_buf[:available_bytes]  # TODO: optimize
+                    self._loop.call_soon_threadsafe(self.mark_output_empty)
+                else:
+                    self._maybe_mark_playback_started()
+                    self._mark_device_audio(frames, output_delay)
+                    chunk = self._output_buf[:bytes_needed]
+                    outdata[:, 0] = np.frombuffer(chunk, dtype=np.int16, count=frames)
+                    del self._output_buf[:bytes_needed]
+                    if not self._output_buf:
+                        self._loop.call_soon_threadsafe(self.mark_output_empty)
 
     def _maybe_mark_playback_started(self) -> None:
         """Mark the playback as started if it hasn't been already. Must be called under ``audio_lock``."""
@@ -784,34 +821,7 @@ class AgentsConsole:
         self._output_delay = time.outputBufferDacTime - time.currentTime
 
         FRAME_SAMPLES = 240
-        with self._io_audio_output.audio_lock:
-            if self._io_audio_output.paused:
-                outdata[:] = 0
-            else:
-                bytes_needed = frames * 2
-                if len(self._io_audio_output.audio_buffer) < bytes_needed:
-                    available_bytes = len(self._io_audio_output.audio_buffer)
-                    if available_bytes > 0:
-                        self._io_audio_output._maybe_mark_playback_started()
-                        self._io_audio_output._mark_device_audio(
-                            available_bytes // 2, self._output_delay
-                        )
-                    outdata[: available_bytes // 2, 0] = np.frombuffer(
-                        self._io_audio_output.audio_buffer,
-                        dtype=np.int16,
-                        count=available_bytes // 2,
-                    )
-                    outdata[available_bytes // 2 :, 0] = 0
-                    del self._io_audio_output.audio_buffer[:available_bytes]  # TODO: optimize
-                    self.io_loop.call_soon_threadsafe(self._io_audio_output.mark_output_empty)
-                else:
-                    self._io_audio_output._maybe_mark_playback_started()
-                    self._io_audio_output._mark_device_audio(frames, self._output_delay)
-                    chunk = self._io_audio_output.audio_buffer[:bytes_needed]
-                    outdata[:, 0] = np.frombuffer(chunk, dtype=np.int16, count=frames)
-                    del self._io_audio_output.audio_buffer[:bytes_needed]
-                    if not self._io_audio_output.audio_buffer:
-                        self.io_loop.call_soon_threadsafe(self._io_audio_output.mark_output_empty)
+        self._io_audio_output.read_into(outdata, frames, output_delay=self._output_delay)
 
         num_chunks = frames // FRAME_SAMPLES
         for i in range(num_chunks):
