@@ -6,7 +6,11 @@ import os
 import wave
 from pathlib import Path
 
+import pytest
+
 from livekit.plugins import azure
+
+pytestmark = pytest.mark.plugin("azure")
 
 
 async def test_chunked_stream():

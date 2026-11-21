@@ -128,6 +128,16 @@ class AnamAPI:
                 session_options.show_ai_avatar_disclosure
             )
 
+        if session_options is not None and session_options.region is not None:
+            if "sessionOptions" not in payload:
+                payload["sessionOptions"] = {}
+            payload["sessionOptions"]["region"] = session_options.region
+
+        if session_options is not None and session_options.region_policy is not None:
+            if "sessionOptions" not in payload:
+                payload["sessionOptions"] = {}
+            payload["sessionOptions"]["regionPolicy"] = session_options.region_policy
+
         headers = {
             "Authorization": f"Bearer {self._api_key}",  # Use API Key here
             "Content-Type": "application/json",
@@ -143,7 +153,7 @@ class AnamAPI:
         url = f"{self._api_url}{endpoint}"
         session = self._session or aiohttp.ClientSession()
         try:
-            for attempt in range(self._conn_options.max_retry):
+            for attempt in range(self._conn_options.max_retry + 1):
                 try:
                     async with session.post(
                         url,
@@ -159,12 +169,22 @@ class AnamAPI:
                                 body=text,
                             )
                         return await response.json()  # type: ignore
+                except APIStatusError as e:
+                    if not e.retryable:
+                        raise
+                    logger.warning(
+                        f"API request to {url} failed on attempt {attempt + 1}",
+                        extra={"error": str(e)},
+                    )
+                    if attempt >= self._conn_options.max_retry:
+                        raise
+                    await asyncio.sleep(self._conn_options.retry_interval)
                 except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                     logger.warning(
                         f"API request to {url} failed on attempt {attempt + 1}",
                         extra={"error": str(e)},
                     )
-                    if attempt >= self._conn_options.max_retry - 1:
+                    if attempt >= self._conn_options.max_retry:
                         raise APIConnectionError(f"Failed to connect to Anam API at {url}") from e
                     await asyncio.sleep(self._conn_options.retry_interval)
         finally:
