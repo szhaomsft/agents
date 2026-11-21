@@ -60,9 +60,8 @@ async def test_foundry_agent_speaks_and_transcribes() -> None:
         audio = asyncio.create_task(receive_speech())
         tasks.extend([audio, asyncio.create_task(send_silence())])
         async with asyncio.timeout(45):
-            while not session.session_id:
-                assert not errors, "Foundry session failed before startup"
-                await asyncio.sleep(0.05)
+            await session.wait_until_ready()
+            assert session.session_id
             session.append_commentary("Say hello to confirm that the voice connection works.")
             assert await audio, "Foundry closed without producing speech"
             while not any(event.text.strip() for event in transcripts):

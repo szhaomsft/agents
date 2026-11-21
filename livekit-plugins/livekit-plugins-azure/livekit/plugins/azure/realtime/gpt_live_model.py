@@ -163,12 +163,26 @@ class GPTLiveSession(_impl.GPTLiveSession):
     def __init__(self, duplex_model: GPTLiveModel) -> None:
         self._foundry_model = duplex_model
         self._conversation_id: str | None = None
+        self._first_started_fut: asyncio.Future[None] = asyncio.Future()
         super().__init__(duplex_model)
 
     @property
     def conversation_id(self) -> str | None:
         """Foundry's conversation ID, distinct from the GPT Live session ID."""
         return self._conversation_id
+
+    async def wait_until_ready(self) -> None:
+        """Wait for Foundry to start the first session, or raise if startup fails."""
+        await asyncio.wait(
+            (self._first_started_fut, self._main_atask),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if self._main_atask.done():
+            await self._main_atask
+            raise APIConnectionError(
+                "Foundry GPT Live session closed before readiness", retryable=False
+            )
+        await self._first_started_fut
 
     async def _create_ws_conn(self) -> aiohttp.ClientWebSocketResponse:
         try:
@@ -249,6 +263,8 @@ class GPTLiveSession(_impl.GPTLiveSession):
                 )
             self._conversation_id = event.get("conversation_id")
         super()._handle_event(event)
+        if event.get("type") == "session.started" and not self._first_started_fut.done():
+            self._first_started_fut.set_result(None)
 
     def _reset_for_reconnect(self) -> None:
         super()._reset_for_reconnect()

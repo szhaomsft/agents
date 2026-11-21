@@ -8,6 +8,7 @@ import contextlib
 import json
 import time
 from collections.abc import AsyncIterator, Callable
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
@@ -213,6 +214,60 @@ async def test_server_starts_session_before_audio_and_preserves_saved_config(
     assert foundry.events[-1]["type"] == "session.close"
 
 
+async def test_ready_waits_for_server_start(foundry: _Foundry) -> None:
+    foundry.auto_start = False
+    async with _session(foundry) as (_, session):
+        await session._update_session()
+        ready = asyncio.create_task(session.wait_until_ready())
+        await _wait(lambda: foundry.connections)
+        assert not ready.done()
+        await foundry.start(foundry.connections[0])
+        await asyncio.wait_for(ready, 2)
+        assert session.session_id == "live-1"
+        await session.wait_until_ready()
+
+
+async def test_cancelled_ready_wait_does_not_cancel_startup(foundry: _Foundry) -> None:
+    foundry.auto_start = False
+    async with _session(foundry) as (_, session):
+        await session._update_session()
+        ready = asyncio.create_task(session.wait_until_ready())
+        await _wait(lambda: foundry.connections)
+        ready.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await ready
+        await foundry.start(foundry.connections[0])
+        await asyncio.wait_for(session.wait_until_ready(), 2)
+
+
+async def test_console_reports_ready_after_foundry_starts(
+    foundry: _Foundry, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from examples.voice_agents import foundry_gpt_live as example
+
+    foundry.auto_start = False
+    model = _model(foundry)
+    try:
+        async with AgentSession(llm=model) as session:
+            session.output.audio = FakeAudioOutput()
+
+            class ConsoleSession:
+                async def start(self, *, agent: Agent, room: Any) -> None:
+                    await session.start(agent)
+
+            monkeypatch.setattr(example.azure.realtime, "GPTLiveModel", lambda: model)
+            monkeypatch.setattr(example, "AgentSession", lambda **kwargs: ConsoleSession())
+            ctx = SimpleNamespace(room=None, add_shutdown_callback=lambda callback: None)
+            entrypoint = asyncio.create_task(example.entrypoint(ctx))
+            await _wait(lambda: foundry.connections)
+            assert "Ready to speak." not in capsys.readouterr().out
+            await foundry.start(foundry.connections[0])
+            await asyncio.wait_for(entrypoint, 2)
+            assert "Ready to speak." in capsys.readouterr().out
+    finally:
+        await model.aclose()
+
+
 async def test_audio_and_transcripts_use_shared_duplex_engine(foundry: _Foundry) -> None:
     async with _session(foundry) as (_, session):
         transcripts: list[Any] = []
@@ -354,7 +409,7 @@ async def test_startup_failures_surface_without_sending_audio(
         await session._update_session()
         session.push_audio(rtc.AudioFrame(PCM, 24000, 1, 2400))
         with pytest.raises(APIError):
-            await asyncio.wait_for(asyncio.shield(session._main_atask), 3)
+            await asyncio.wait_for(session.wait_until_ready(), 3)
         assert errors and not errors[-1].recoverable
         assert not any(event["type"] == "session.input_audio.append" for event in foundry.events)
 

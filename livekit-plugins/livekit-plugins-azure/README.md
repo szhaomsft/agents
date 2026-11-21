@@ -79,6 +79,9 @@ conversation and supplies previous transcripts as context; it does not resume
 the old backend conversation or pending tool execution.
 
 See `examples/voice_agents/foundry_gpt_live.py` for a runnable LiveKit agent.
+It prints `Ready to speak.` after Foundry starts the session. Use
+`await duplex.wait_until_ready()` on the Azure `GPTLiveSession` returned by
+`agent.duplex_session` to wait for the same signal in your application.
 
 #### Create an agent for the US Data Zone
 

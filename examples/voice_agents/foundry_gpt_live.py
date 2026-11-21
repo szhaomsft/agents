@@ -5,6 +5,8 @@ The saved agent must use the live sub-protocol and PCM16 audio at 24000 Hz.
 Run: python foundry_gpt_live.py console
 """
 
+from typing import cast
+
 from dotenv import load_dotenv
 
 from livekit.agents import Agent, AgentServer, AgentSession, JobContext, cli
@@ -20,7 +22,11 @@ async def entrypoint(ctx: JobContext) -> None:
     ctx.add_shutdown_callback(model.aclose)
     session = AgentSession(llm=model)
     # Foundry supplies the instructions, voice and greeting from the saved definition.
-    await session.start(agent=Agent(instructions=""), room=ctx.room)
+    agent = Agent(instructions="")
+    await session.start(agent=agent, room=ctx.room)
+    duplex = cast(azure.realtime.GPTLiveSession, agent.duplex_session)
+    await duplex.wait_until_ready()
+    print("\nReady to speak.", flush=True)
 
 
 if __name__ == "__main__":
