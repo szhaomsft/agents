@@ -2,5 +2,13 @@
 
 from .gpt_live_model import GPTLiveModel, GPTLiveSession
 from .realtime_model import RealtimeModel, RealtimeSession
+from .voice_agent_model import VoiceAgentModel, VoiceAgentSession
 
-__all__ = ["GPTLiveModel", "GPTLiveSession", "RealtimeModel", "RealtimeSession"]
+__all__ = [
+    "GPTLiveModel",
+    "GPTLiveSession",
+    "RealtimeModel",
+    "RealtimeSession",
+    "VoiceAgentModel",
+    "VoiceAgentSession",
+]

@@ -141,6 +141,46 @@ If needed, set `FOUNDRY_GPT_LIVE_STRUCTURED_INPUTS` to a JSON object matching th
 saved agent's placeholders and `FOUNDRY_GPT_LIVE_DELEGATION` to its delegation
 type. The test uses your existing agent and does not provision or delete resources.
 
+### Foundry GPT Realtime and cascade voice agents
+
+`azure.realtime.VoiceAgentModel` connects an existing Foundry voice agent using
+the Azure Voice Agent SDK. This separate path supports agents configured with the
+`realtime` sub-protocol, including GPT Realtime and a server-side speech-to-text,
+language model, and text-to-speech cascade. It does not create an agent.
+
+Install `livekit-plugins-azure[agents]`, authenticate with `az login`, and set
+`FOUNDRY_PROJECT_ENDPOINT` and `AGENT_NAME` as above. The saved agent must use
+24 kHz PCM16 input and output, audio output, and server turn detection with
+automatic responses enabled. Configure
+its voice, model, instructions and tools in Foundry. Omit structured inputs unless
+the agent declares them; the console example accepts them as a JSON object in
+`FOUNDRY_STRUCTURED_INPUTS`.
+
+```python
+model = azure.realtime.VoiceAgentModel()
+session = AgentSession(llm=model)
+agent = Agent(instructions="")  # keep Foundry's saved instructions
+await session.start(agent=agent, room=ctx.room)
+realtime = agent.realtime_llm_session  # cast to VoiceAgentSession for wait_until_ready()
+```
+
+Run `python examples/voice_agents/foundry_voice_agent.py console` to chat with a
+microphone; it prints `Ready to speak.` once Foundry's saved configuration is
+applied. `agent_version`, `structured_inputs`, and a caller-owned async Azure
+credential are optional constructor arguments. Call `await model.aclose()` on
+shutdown. Set `user_transcription=False` if the saved agent has no input
+transcription; the default is `True` and must match its configuration. Local
+function implementations may be bound with `@function_tool`,
+but their schemas must already be declared in Foundry. Nonempty LiveKit session
+instructions and session-level tool overrides are not supported; per-response
+instructions are appended to Foundry's returned saved instructions. Reconnecting
+opens a new conversation and replays its compatible local history.
+
+Run offline tests with `uv run pytest tests/test_plugin_azure_voice_agent.py --unit`.
+To test speech against an existing agent, set `FOUNDRY_VOICE_AGENT_SMOKE=1`
+and run `uv run pytest tests/test_plugin_azure_voice_agent_integration.py --plugin azure`.
+This opt-in test uses the configured agent and incurs usage charges.
+
 ### Azure Credentials
 
 For the realtime speech-to-speech model:

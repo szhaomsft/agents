@@ -30,6 +30,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+agents = [
+    "azure-ai-projects[voice]>=2.11.0,<3",
+]
 realtime = [
     # 1.2.0 adds response metadata, which pairs generate_reply with its response
     "azure-ai-voicelive[aiohttp]>=1.2.0",

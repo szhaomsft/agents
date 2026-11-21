@@ -705,6 +705,29 @@ wheels = [
 ]
 
 [[package]]
+name = "azure-ai-projects"
+version = "2.11.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "azure-core" },
+    { name = "azure-identity" },
+    { name = "azure-storage-blob" },
+    { name = "isodate" },
+    { name = "openai" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/6d/f2/b9bfee9089a0744663dabb9d1415db2facf4113a9cd2c51b572da2297715/azure_ai_projects-2.11.0.tar.gz", hash = "sha256:eda340da7cabffd0b05b4b5bb8c6c8a5b7a5a8fca495785a1097f2fec8c153f8", size = 1400166, upload-time = "2026-11-13T00:05:19.016Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/65/90/9b5aef3eb12d8a18d698150764da5eb5a7193a8345db493bb891563f9511/azure_ai_projects-2.11.0-py3-none-any.whl", hash = "sha256:add3f4cc37724abbc3bae4fe2bcfa2b11bd70fc19bc1f1fc68c453532b05c393", size = 692845, upload-time = "2026-11-13T00:05:21.202Z" },
+]
+
+[package.optional-dependencies]
+voice = [
+    { name = "aiohttp" },
+    { name = "websockets" },
+]
+
+[[package]]
 name = "azure-ai-voicelive"
 version = "1.3.0"
 source = { registry = "https://pypi.org/simple" }
@@ -766,6 +789,21 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/c5/0e/3a63efb48aa4a5ae2cfca61ee152fbcb668092134d3eb8bfda472dd5c617/azure_identity-1.25.3.tar.gz", hash = "sha256:ab23c0d63015f50b630ef6c6cf395e7262f439ce06e5d07a64e874c724f8d9e6", size = 286304, upload-time = "2026-03-13T01:12:20.892Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/49/9a/417b3a533e01953a7c618884df2cb05a71e7b68bdbce4fbdb62349d2a2e8/azure_identity-1.25.3-py3-none-any.whl", hash = "sha256:f4d0b956a8146f30333e071374171f3cfa7bdb8073adb8c3814b65567aa7447c", size = 192138, upload-time = "2026-03-13T01:12:22.951Z" },
+]
+
+[[package]]
+name = "azure-storage-blob"
+version = "12.31.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "azure-core" },
+    { name = "cryptography" },
+    { name = "isodate" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/6f/18/eb2ade6eede419d33493016ec3243ca9860f67d0bc71aa0461cda2cad0c4/azure_storage_blob-12.31.1.tar.gz", hash = "sha256:0d6e5b860a1357efc602db04cfa7c9950ac86126edcf7db89320cde281555fe5", size = 672417, upload-time = "2026-10-29T23:34:05.69Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/1a/93/b9f0dc477827887aef64012946bdba65e9aad67084ad38044661a72fe47d/azure_storage_blob-12.31.1-py3-none-any.whl", hash = "sha256:9e012d5f4ab658b7cb8a4581329d7a7aa2bf5f39b4d63baeefaae7f9e90fe6f0", size = 455904, upload-time = "2026-10-29T23:34:07.459Z" },
 ]
 
 [[package]]
@@ -2972,6 +3010,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+agents = [
+    { name = "azure-ai-projects", extra = ["voice"] },
+]
 realtime = [
     { name = "azure-ai-voicelive", extra = ["aiohttp"] },
     { name = "azure-identity" },
@@ -2979,6 +3020,7 @@ realtime = [
 
 [package.metadata]
 requires-dist = [
+    { name = "azure-ai-projects", extras = ["voice"], marker = "extra == 'agents'", specifier = ">=2.11.0,<3" },
     { name = "azure-ai-voicelive", extras = ["aiohttp"], specifier = ">=1.2.0" },
     { name = "azure-ai-voicelive", extras = ["aiohttp"], marker = "extra == 'realtime'", specifier = ">=1.2.0" },
     { name = "azure-cognitiveservices-speech", specifier = ">=1.48.2" },
@@ -2987,7 +3029,7 @@ requires-dist = [
     { name = "httpx2", specifier = ">=2.12,<3" },
     { name = "livekit-agents", extras = ["openai"], editable = "livekit-agents" },
 ]
-provides-extras = ["realtime"]
+provides-extras = ["agents", "realtime"]
 
 [[package]]
 name = "livekit-plugins-baseten"
