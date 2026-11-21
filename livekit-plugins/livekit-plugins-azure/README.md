@@ -22,6 +22,122 @@ pip install "livekit-plugins-azure[realtime]"
 
 ## Realtime Mode (Azure Voice Live)
 
+### Foundry GPT Live voice agents (full duplex)
+
+Use `azure.realtime.GPTLiveModel` for an **existing Foundry voice agent** with
+`kind="voice"` and `sub_protocol="live"`. This is distinct from `RealtimeModel`
+below: GPT Live continuously listens and speaks, while Foundry owns its model,
+voice, greeting, instructions and delegation backend.
+
+Create/configure the agent using the
+[Microsoft GPT Live samples](https://github.com/microsoft/voice-agent/tree/main/samples/gpt_live).
+Configure PCM16 audio at **24000 Hz** in the saved agent definition. Authenticate
+with `az login` or another identity supported by `DefaultAzureCredential`, and set:
+
+```bash
+export FOUNDRY_PROJECT_ENDPOINT=https://<resource>.services.ai.azure.com/api/projects/<project>
+export AGENT_NAME=<saved-voice-agent-name>
+```
+
+```python
+from livekit.agents import Agent, AgentSession
+from livekit.plugins import azure
+
+model = azure.realtime.GPTLiveModel()
+session = AgentSession(llm=model)
+await session.start(agent=Agent(instructions=""), room=ctx.room)
+```
+
+Optionally pass `agent_version` to pin an existing saved version, or
+`structured_inputs` for template placeholders declared by your agent.
+Omit `structured_inputs` when the agent declares none: undeclared inputs cause an
+HTTP 400 WebSocket handshake failure. Foundry starts the session
+and fills its templates; the client waits for `session.started` and does **not**
+send `session.start`. Nonempty LiveKit `Agent.instructions` are appended as
+additional instructions, not substituted for the saved definition. Initial chat
+history is appended as context. Configure frontend model, voice, and backend
+settings in Foundry rather than passing direct OpenAI deployment options.
+
+Set `delegation` to match the saved agent: `"responses"` (default), `"client"`,
+or `"foundry_managed_agent"`. Responses and managed-agent backends support local
+`@function_tool` implementations for functions **already declared in Foundry**;
+the plugin does not replace their saved tool schemas. Client delegation instead
+requires a `delegation_created` handler on `agent.duplex_session` that calls
+`append_commentary(text, delegation_id=event.id)` with the answer.
+
+Authentication uses the `https://ai.azure.com/.default` scope and the
+`Foundry-Features: VoiceAgents=V1Preview` header. Tokens are reacquired for every
+connection. You can pass an async Azure `credential` (for example
+`AzureCliCredential`) and a shared `http_session`; these remain caller-owned.
+Close the model with `await model.aclose()` after its sessions to release any
+internally owned resources. No API key is required.
+
+`store=None` preserves the saved agent's storage policy; explicitly pass `True`
+or `False` to override it. `GPTLiveSession.conversation_id` exposes the Foundry
+conversation ID separately from `session_id`. A reconnect opens a **new**
+conversation and supplies previous transcripts as context; it does not resume
+the old backend conversation or pending tool execution.
+
+See `examples/voice_agents/foundry_gpt_live.py` for a runnable LiveKit agent.
+
+#### Create an agent for the US Data Zone
+
+Data Zone routing is selected by the **model deployment SKU**, not by an agent
+flag, its name, or a US project endpoint alone. The previously shown connection
+example does not create an agent or change deployment routing.
+
+Create a GPT Live deployment and a Responses-compatible backend deployment in the
+same US Foundry account using `DataZoneStandard` (or supported
+`DataZoneProvisionedManaged`). Both must use Data Zone SKUs: a global reasoning
+backend would still process delegated content outside the intended boundary.
+Availability and quota depend on the model and region.
+
+The creation example verifies the account's US geography and the project endpoint,
+checks both existing deployments, and creates a uniquely named saved agent. It
+never provisions models or modifies an existing agent. It uses the Azure Projects
+SDK only for authoring; the runtime plugin does not require that SDK.
+
+```powershell
+az login
+$env:FOUNDRY_PROJECT_ENDPOINT = 'https://<account>.services.ai.azure.com/api/projects/<project>'
+$account = '/subscriptions/<subscription>/resourceGroups/<group>/providers/Microsoft.CognitiveServices/accounts/<account>'
+
+uv run --script examples/voice_agents/create_foundry_gpt_live.py `
+  --account-resource-id $account `
+  --voice-deployment '<gpt-live-us-datazone-deployment>' `
+  --backend-deployment '<responses-us-datazone-deployment>' `
+  --check-only
+```
+
+Remove `--check-only` to create and retain a new agent. The command requires Azure
+management-plane read access and Foundry agent creation permission. Set
+`AGENT_NAME` to the printed name, then run
+`python examples/voice_agents/foundry_gpt_live.py console` using your LiveKit environment.
+The agent uses PCM16/24 kHz, `marin`, Responses delegation and `store=False`.
+
+These checks cover the two model deployments, not every part of a customer's
+data-residency policy. Review Foundry storage, tools, telemetry and your LiveKit
+hosting separately. See Microsoft's
+[deployment-type documentation](https://learn.microsoft.com/en-us/azure/foundry/foundry-models/concepts/deployment-types).
+
+Offline protocol tests run with:
+
+```bash
+uv run pytest tests/test_plugin_azure_gpt_live.py --unit
+```
+
+An opt-in, billable deployment smoke test checks server startup, generated audio,
+and its transcript. Set `FOUNDRY_GPT_LIVE_SMOKE=1` alongside the project endpoint
+and agent name, then run:
+
+```bash
+uv run pytest tests/test_plugin_azure_gpt_live_integration.py --plugin azure
+```
+
+If needed, set `FOUNDRY_GPT_LIVE_STRUCTURED_INPUTS` to a JSON object matching the
+saved agent's placeholders and `FOUNDRY_GPT_LIVE_DELEGATION` to its delegation
+type. The test uses your existing agent and does not provision or delete resources.
+
 ### Azure Credentials
 
 For the realtime speech-to-speech model:
