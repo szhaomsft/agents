@@ -29,6 +29,41 @@ Use `azure.realtime.GPTLiveModel` for an **existing Foundry voice agent** with
 below: GPT Live continuously listens and speaks, while Foundry owns its model,
 voice, greeting, instructions and delegation backend.
 
+For this sample, use a Foundry resource and project in **Central US**
+(`centralus`) and select the **managed US Data Zone `gpt-live-1` model**:
+set `model_type="managed"` and `model="gpt-live-1"` in the saved agent definition.
+You do not need to create a customer GPT Live model deployment or allocate
+deployment quota for this managed path. US Data Zone describes the processing
+boundary; it does not mean all inference happens exclusively in Central US.
+
+For managed Responses delegation in Central US, use a supported backend model
+name such as `gpt-6-luna`, not a customer deployment name. The service currently
+accepts `gpt-6-luna` and `gpt-6.1-sol` for this managed model. For another backend,
+use `foundry_managed_agent` delegation instead. A minimal managed definition is:
+
+```json
+{
+  "kind": "voice",
+  "sub_protocol": "live",
+  "model_type": "managed",
+  "model": "gpt-live-1",
+  "instructions": "Be a concise voice assistant. Delegate questions requiring tools.",
+  "audio": {
+    "format": {"type": "audio/pcm", "rate": 24000},
+    "output": {"voice": "marin"}
+  },
+  "delegation": {
+    "type": "responses",
+    "responses": {"model": "gpt-6-luna"}
+  },
+  "store": false
+}
+```
+
+Add the local tool schema from **Bind a local Python tool** below when using the
+current-time example. The runtime connects to the saved agent in either managed
+or self-deployed mode; the model mode is not a local environment variable.
+
 Create/configure the agent using the
 [Microsoft GPT Live samples](https://github.com/microsoft/voice-agent/tree/main/samples/gpt_live).
 Configure PCM16 audio at **24000 Hz** in the saved agent definition. Authenticate
@@ -123,7 +158,8 @@ internally owned resources. No API key is required.
 
 `store=None` preserves the saved agent's storage policy; explicitly pass `True`
 or `False` to override it. `GPTLiveSession.conversation_id` exposes the Foundry
-conversation ID separately from `session_id`. A reconnect opens a **new**
+conversation ID separately from `session_id`, when the service supplies it.
+Storage-disabled managed sessions may omit it. A reconnect opens a **new**
 conversation and supplies previous transcripts as context; it does not resume
 the old backend conversation or pending tool execution.
 
@@ -207,19 +243,21 @@ and argument schemas must match the saved declarations. This example uses the
 default `delegation="responses"`; it is not the `delegation="client"` callback
 flow described above.
 
-#### Create an agent for the US Data Zone
+#### Alternative: create an agent with self-deployed US Data Zone models
 
-Data Zone routing is selected by the **model deployment SKU**, not by an agent
-flag, its name, or a US project endpoint alone. The previously shown connection
-example does not create an agent or change deployment routing.
+The following creation script is for `model_type="self_deployed"`, not the
+managed `gpt-live-1` setup above. For self-deployed models, Data Zone routing is
+selected by the **model deployment SKU**, not by an agent flag, its name, or a US
+project endpoint alone. The connection example does not change deployment routing.
 
 Create a GPT Live deployment and a Responses-compatible backend deployment in the
-same US Foundry account using `DataZoneStandard` (or supported
+same **Central US** Foundry account using `DataZoneStandard` (or supported
 `DataZoneProvisionedManaged`). Both must use Data Zone SKUs: a global reasoning
 backend would still process delegated content outside the intended boundary.
 Availability and quota depend on the model and region.
 
-The creation example verifies the account's US geography and the project endpoint,
+Select Central US when creating the resource. The creation example verifies the
+account's US geography (not specifically Central US) and the project endpoint,
 checks both existing deployments, and creates a uniquely named saved agent. It
 never provisions models or modifies an existing agent. It uses the Azure Projects
 SDK only for authoring; the runtime plugin does not require that SDK.

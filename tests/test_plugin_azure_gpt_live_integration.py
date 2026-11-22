@@ -67,7 +67,7 @@ async def test_foundry_agent_speaks_and_transcribes() -> None:
             while not any(event.text.strip() for event in transcripts):
                 assert not errors, "Foundry session failed before producing a transcript"
                 await asyncio.sleep(0.05)
-        assert session.conversation_id
+        # Storage-disabled managed agents may omit the conversation ID.
         assert not errors
     finally:
         await utils.aio.cancel_and_wait(*tasks)
