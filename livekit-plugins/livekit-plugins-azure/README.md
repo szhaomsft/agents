@@ -35,9 +35,58 @@ Configure PCM16 audio at **24000 Hz** in the saved agent definition. Authenticat
 with `az login` or another identity supported by `DefaultAzureCredential`, and set:
 
 ```bash
-export FOUNDRY_PROJECT_ENDPOINT=https://<resource>.services.ai.azure.com/api/projects/<project>
-export AGENT_NAME=<saved-voice-agent-name>
+export FOUNDRY_PROJECT_ENDPOINT="https://<resource>.services.ai.azure.com/api/projects/<project>"
+export AGENT_NAME="<saved-voice-agent-name>"
 ```
+
+To set these variables directly and run the microphone example in PowerShell,
+from the repository root with the project environment installed:
+
+```powershell
+az login
+$env:FOUNDRY_PROJECT_ENDPOINT = 'https://<resource>.services.ai.azure.com/api/projects/<project>'
+$env:AGENT_NAME = '<saved-voice-agent-name>'
+$env:AZURE_TOKEN_CREDENTIALS = 'AzureCliCredential' # optional; requires azure-identity >= 1.24
+uv run --no-sync python examples\voice_agents\foundry_gpt_live.py console
+```
+
+Replace the placeholders before running. These variables apply to the current
+PowerShell session; no `.env` file is needed. To use the example's local
+function tool, the saved agent also needs the schema described in **Bind a local
+Python tool** below.
+
+Alternatively, you can save these connection settings in
+`examples/voice_agents/.env`. From the repository root, copy the template only
+if a voice-agent `.env` does not already exist:
+
+```powershell
+if (-not (Test-Path examples\voice_agents\.env)) {
+    Copy-Item examples\voice_agents\.env.example examples\voice_agents\.env
+}
+```
+
+Replace the placeholders in `examples/voice_agents/.env`, then run:
+
+```powershell
+az login
+$env:AZURE_TOKEN_CREDENTIALS = 'AzureCliCredential' # optional; requires azure-identity >= 1.24
+uv run --no-sync python examples\voice_agents\foundry_gpt_live.py console
+```
+
+The example calls `load_dotenv()`, which loads the nearest `.env` starting in
+`examples/voice_agents`; it does not load `.env.example` directly. If you have
+settings in `examples/.env`, copy the needed values into the voice-agent `.env`:
+the files are not merged. Existing shell environment variables take precedence,
+so clear or update an old `AGENT_NAME` before switching between GPT Live and
+realtime/cascade agents. LiveKit connection settings are needed for `dev` and
+`start` modes, but not `console`. Keep real credentials out of `.env.example`
+and do not commit `.env`. Model deployments, voice, greeting and backend
+instructions remain in the saved Foundry definition, not in this environment
+file. On a local development machine, `DefaultAzureCredential` uses the
+`az login` session.
+Setting `AZURE_TOKEN_CREDENTIALS` to `AzureCliCredential` is optional and limits
+the credential chain to Azure CLI; it is supported by azure-identity 1.24.0 and
+later.
 
 ```python
 from livekit.agents import Agent, AgentSession
@@ -82,6 +131,81 @@ See `examples/voice_agents/foundry_gpt_live.py` for a runnable LiveKit agent.
 It prints `Ready to speak.` after Foundry starts the session. Use
 `await duplex.wait_until_ready()` on the Azure `GPTLiveSession` returned by
 `agent.duplex_session` to wait for the same signal in your application.
+
+#### Bind a local Python tool
+
+There are two parts: declare the function schema in Foundry, and register its
+implementation in LiveKit. Adding a Python decorator alone does not publish a
+tool schema to the saved agent.
+
+For a saved agent using Responses delegation, this schema belongs in
+`delegation.responses.tools` (not top-level `tools`). The updater below adds or
+replaces only the `get_current_time` entry, preserving other tools and settings:
+
+```json
+{
+  "type": "function",
+  "name": "get_current_time",
+  "description": "Get the current UTC time.",
+  "parameters": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false
+  },
+  "strict": true
+}
+```
+
+Configure the voice instructions to delegate current-time questions and the
+Responses backend instructions to use `get_current_time`. Ensure the version
+you connect to contains this schema. For `foundry_managed_agent` delegation,
+declare the function on the delegated prompt agent instead.
+
+`examples/voice_agents/foundry_gpt_live.py` already implements this local tool:
+
+```python
+from datetime import datetime, timezone
+
+from livekit.agents import function_tool
+
+
+@function_tool
+async def get_current_time() -> str:
+    """Get the current UTC time."""
+    return datetime.now(timezone.utc).isoformat()
+```
+
+The example registers it with:
+
+```python
+agent = Agent(instructions="", tools=[get_current_time])
+```
+
+To update an existing agent, authenticate with `az login` and run the updater.
+It reads the latest saved version and defaults to a dry run:
+
+```powershell
+uv run --no-sync python examples\voice_agents\update_foundry_gpt_live_tool.py
+```
+
+Review the change, then pass `--apply` to create a new immutable version. This
+changes the version used when clients resolve the agent's latest version; it does
+not edit prior versions. The script uses `FOUNDRY_PROJECT_ENDPOINT` and
+`AGENT_NAME` from `examples/voice_agents/.env` or the process environment.
+Alternatively, configure the schema manually in Foundry. In a repository
+checkout, `uv run --no-sync` uses the installed project environment and avoids
+creating an isolated script environment that downloads dependencies.
+
+After the schema is saved, run the console example and ask
+**"What is the current UTC time?"** Without the saved schema, the backend cannot
+select this local tool.
+
+The function runs in your local LiveKit process; its result is returned to the
+delegation backend, and GPT Live speaks the resulting answer. Function names
+and argument schemas must match the saved declarations. This example uses the
+default `delegation="responses"`; it is not the `delegation="client"` callback
+flow described above.
 
 #### Create an agent for the US Data Zone
 
