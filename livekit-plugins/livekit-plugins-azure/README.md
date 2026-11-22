@@ -35,11 +35,27 @@ Configure PCM16 audio at **24000 Hz** in the saved agent definition. Authenticat
 with `az login` or another identity supported by `DefaultAzureCredential`, and set:
 
 ```bash
-export FOUNDRY_PROJECT_ENDPOINT=https://<resource>.services.ai.azure.com/api/projects/<project>
-export AGENT_NAME=<saved-voice-agent-name>
+export FOUNDRY_PROJECT_ENDPOINT="https://<resource>.services.ai.azure.com/api/projects/<project>"
+export AGENT_NAME="<saved-voice-agent-name>"
 ```
 
-For the microphone example, you can save these connection settings in
+To set these variables directly and run the microphone example in PowerShell,
+from the repository root with the project environment installed:
+
+```powershell
+az login
+$env:FOUNDRY_PROJECT_ENDPOINT = 'https://<resource>.services.ai.azure.com/api/projects/<project>'
+$env:AGENT_NAME = '<saved-voice-agent-name>'
+$env:AZURE_TOKEN_CREDENTIALS = 'AzureCliCredential' # optional; requires azure-identity >= 1.24
+uv run --no-sync python examples\voice_agents\foundry_gpt_live.py console
+```
+
+Replace the placeholders before running. These variables apply to the current
+PowerShell session; no `.env` file is needed. To use the example's local
+function tool, the saved agent also needs the schema described in **Bind a local
+Python tool** below.
+
+Alternatively, you can save these connection settings in
 `examples/voice_agents/.env`. From the repository root, copy the template only
 if a voice-agent `.env` does not already exist:
 
