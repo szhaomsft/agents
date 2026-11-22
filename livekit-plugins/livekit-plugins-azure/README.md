@@ -40,14 +40,16 @@ export AGENT_NAME=<saved-voice-agent-name>
 ```
 
 For the microphone example, you can save these connection settings in
-`examples/.env`. From the repository root, copy the template once (do not
-overwrite an existing `.env`):
+`examples/voice_agents/.env`. From the repository root, copy the template only
+if a voice-agent `.env` does not already exist:
 
 ```powershell
-Copy-Item examples\.env.example examples\.env
+if (-not (Test-Path examples\voice_agents\.env)) {
+    Copy-Item examples\voice_agents\.env.example examples\voice_agents\.env
+}
 ```
 
-Replace the placeholders in `examples/.env`, then run:
+Replace the placeholders in `examples/voice_agents/.env`, then run:
 
 ```powershell
 az login
@@ -55,13 +57,17 @@ $env:AZURE_TOKEN_CREDENTIALS = 'AzureCliCredential' # optional; requires azure-i
 uv run --no-sync python examples\voice_agents\foundry_gpt_live.py console
 ```
 
-The example calls `load_dotenv()`, which finds `examples/.env`; it does not load
-`.env.example` directly. Existing shell environment variables take precedence,
+The example calls `load_dotenv()`, which loads the nearest `.env` starting in
+`examples/voice_agents`; it does not load `.env.example` directly. If you have
+settings in `examples/.env`, copy the needed values into the voice-agent `.env`:
+the files are not merged. Existing shell environment variables take precedence,
 so clear or update an old `AGENT_NAME` before switching between GPT Live and
-realtime/cascade agents. Keep real credentials out of `.env.example` and do not
-commit `.env`. Model deployments, voice, greeting and backend instructions remain
-in the saved Foundry definition, not in this environment file. On a local
-development machine, `DefaultAzureCredential` uses the `az login` session.
+realtime/cascade agents. LiveKit connection settings are needed for `dev` and
+`start` modes, but not `console`. Keep real credentials out of `.env.example`
+and do not commit `.env`. Model deployments, voice, greeting and backend
+instructions remain in the saved Foundry definition, not in this environment
+file. On a local development machine, `DefaultAzureCredential` uses the
+`az login` session.
 Setting `AZURE_TOKEN_CREDENTIALS` to `AzureCliCredential` is optional and limits
 the credential chain to Azure CLI; it is supported by azure-identity 1.24.0 and
 later.
@@ -170,10 +176,10 @@ uv run --no-sync python examples\voice_agents\update_foundry_gpt_live_tool.py
 Review the change, then pass `--apply` to create a new immutable version. This
 changes the version used when clients resolve the agent's latest version; it does
 not edit prior versions. The script uses `FOUNDRY_PROJECT_ENDPOINT` and
-`AGENT_NAME` from `examples/.env` or the process environment. Alternatively,
-configure the schema manually in Foundry. In a repository checkout, `uv run
---no-sync` uses the installed project environment and avoids creating an
-isolated script environment that downloads dependencies.
+`AGENT_NAME` from `examples/voice_agents/.env` or the process environment.
+Alternatively, configure the schema manually in Foundry. In a repository
+checkout, `uv run --no-sync` uses the installed project environment and avoids
+creating an isolated script environment that downloads dependencies.
 
 After the schema is saved, run the console example and ask
 **"What is the current UTC time?"** Without the saved schema, the backend cannot

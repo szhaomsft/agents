@@ -1,7 +1,7 @@
 """Use an existing Foundry GPT Live voice agent with LiveKit.
 
 Configure FOUNDRY_PROJECT_ENDPOINT and AGENT_NAME, then authenticate with `az login`.
-Copy examples/.env.example to examples/.env for local connection settings.
+Copy examples/voice_agents/.env.example to examples/voice_agents/.env for settings.
 The saved agent must use the live sub-protocol, Responses delegation and PCM16
 audio at 24000 Hz. Declare get_current_time in delegation.responses.tools using
 the schema in the Azure plugin README, then ask "What is the current UTC time?"
