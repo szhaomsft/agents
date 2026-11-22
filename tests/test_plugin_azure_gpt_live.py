@@ -240,11 +240,18 @@ async def test_cancelled_ready_wait_does_not_cancel_startup(foundry: _Foundry) -
         await asyncio.wait_for(session.wait_until_ready(), 2)
 
 
-async def test_console_reports_ready_after_foundry_starts(
+async def test_console_waits_for_readiness_and_executes_local_tool(
     foundry: _Foundry, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     from examples.voice_agents import foundry_gpt_live as example
 
+    class FixedDatetime:
+        @staticmethod
+        def now(tz: Any) -> Any:
+            assert tz is example.timezone.utc
+            return SimpleNamespace(isoformat=lambda: "2026-11-22T00:00:00+00:00")
+
+    monkeypatch.setattr(example, "datetime", FixedDatetime)
     foundry.auto_start = False
     model = _model(foundry)
     try:
@@ -264,6 +271,42 @@ async def test_console_reports_ready_after_foundry_starts(
             await foundry.start(foundry.connections[0])
             await asyncio.wait_for(entrypoint, 2)
             assert "Ready to speak." in capsys.readouterr().out
+            ws = foundry.connections[0]
+            await ws.send_json(
+                {
+                    "type": "session.delegation.created",
+                    "offset_ms": 100,
+                    "delegation": {"id": "time-delegation", "target": "responses"},
+                }
+            )
+            for event in (
+                {"type": "response.created"},
+                {
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "function_call",
+                        "status": "completed",
+                        "id": "time-item",
+                        "call_id": "time-call",
+                        "name": "get_current_time",
+                        "arguments": "{}",
+                    },
+                },
+                {"type": "response.completed", "response": {"id": "time-response"}},
+            ):
+                await ws.send_json(
+                    {"type": "response.event", "delegation_id": "time-delegation", "event": event}
+                )
+            await _wait(lambda: any(e["type"] == "response.create" for e in foundry.events))
+            results = [e["item"] for e in foundry.events if e["type"] == "response.item.create"]
+            assert results == [
+                {
+                    "type": "function_call_output",
+                    "call_id": "time-call",
+                    "output": "2026-11-22T00:00:00+00:00",
+                }
+            ]
+            assert not any(e["type"] == "session.update" for e in foundry.events)
     finally:
         await model.aclose()
 
