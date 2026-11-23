@@ -1,10 +1,11 @@
 # /// script
 # dependencies = ["azure-identity>=1.25.1", "python-dotenv>=1.0.0"]
 # ///
-"""Add or update the local get_current_time tool schema on a saved GPT Live agent.
+"""Update a local tool schema or managed model on a saved GPT Live agent.
 
 Run with uv run --script. The default is a dry run; pass --apply to create a
-new immutable version of the saved agent.
+new immutable version of the saved agent. Pass --model to update only the
+managed voice model instead of the get_current_time tool schema.
 """
 
 from __future__ import annotations
@@ -31,11 +32,14 @@ CURRENT_TIME_TOOL: dict[str, Any] = {
 }
 
 
-def update_tool_schema(definition: dict[str, Any]) -> bool:
-    """Update the local time tool declaration; return whether the definition changed."""
+def _validate_gpt_live_agent(definition: dict[str, Any]) -> None:
     if definition.get("kind") != "voice" or definition.get("sub_protocol") != "live":
         raise ValueError("The selected agent version must use the GPT Live voice protocol")
 
+
+def update_tool_schema(definition: dict[str, Any]) -> bool:
+    """Update the local time tool declaration; return whether the definition changed."""
+    _validate_gpt_live_agent(definition)
     delegation = definition.get("delegation")
     if not isinstance(delegation, dict) or delegation.get("type") != "responses":
         raise ValueError("The selected agent version must use Responses delegation")
@@ -63,6 +67,19 @@ def update_tool_schema(definition: dict[str, Any]) -> bool:
     return True
 
 
+def update_managed_model(definition: dict[str, Any], model: str) -> bool:
+    """Update the managed voice model; return whether the definition changed."""
+    _validate_gpt_live_agent(definition)
+    if definition.get("model_type") != "managed":
+        raise ValueError("The selected agent version must use a managed voice model")
+    if not model or model != model.strip():
+        raise ValueError("The managed voice model name must not be empty or padded with whitespace")
+    if definition.get("model") == model:
+        return False
+    definition["model"] = model
+    return True
+
+
 def request_json(url: str, token: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
     request = Request(
         url,
@@ -86,6 +103,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project-endpoint", default=os.environ.get("FOUNDRY_PROJECT_ENDPOINT"))
     parser.add_argument("--agent-name", default=os.environ.get("AGENT_NAME"))
+    parser.add_argument(
+        "--model",
+        help="Update only the managed voice model instead of the local tool schema",
+    )
     parser.add_argument(
         "--apply",
         action="store_true",
@@ -121,18 +142,29 @@ def main() -> None:
         if not isinstance(definition, dict):
             raise ValueError("Foundry did not return the latest agent definition")
 
-        changed = update_tool_schema(definition)
+        if args.model is None:
+            changed = update_tool_schema(definition)
+            update_description = "add or update get_current_time"
+            preview: dict[str, Any] = CURRENT_TIME_TOOL
+        else:
+            changed = update_managed_model(definition, args.model)
+            update_description = "change the managed voice model"
+            preview = {"model": args.model}
         current_version = latest.get("version", "unknown")
         if not changed:
-            print(f"{args.agent_name} version {current_version} already has the requested schema.")
+            if args.model is None:
+                print(
+                    f"{args.agent_name} version {current_version} already has the requested schema."
+                )
+            else:
+                print(f"{args.agent_name} version {current_version} already uses {args.model}.")
             return
 
         if not args.apply:
             print(
-                f"Dry run: {args.agent_name} version {current_version} would add or update "
-                "get_current_time:"
+                f"Dry run: {args.agent_name} version {current_version} would {update_description}:"
             )
-            print(json.dumps(CURRENT_TIME_TOOL, indent=2))
+            print(json.dumps(preview, indent=2))
             print("Review the change, then rerun with --apply to create a new version.")
             return
 
