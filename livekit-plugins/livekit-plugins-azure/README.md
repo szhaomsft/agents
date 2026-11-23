@@ -66,31 +66,72 @@ Add the local tool schema from **Bind a local Python tool** below when using the
 current-time example. The runtime connects to the saved agent in either managed
 or self-deployed mode; the model mode is not a local environment variable.
 
-Create/configure the agent using the
-[Microsoft GPT Live samples](https://github.com/microsoft/voice-agent/tree/main/samples/gpt_live).
-Configure PCM16 audio at **24000 Hz** in the saved agent definition. Authenticate
-with `az login` or another identity supported by `DefaultAzureCredential`, and set:
+To create a managed agent, start with an existing Foundry resource and project in
+Central US. The following script checks the account's region and project endpoint,
+then creates a uniquely named agent using `gpt-live-1-datazone`, `gpt-6-luna`, and
+the sample voice and backend instructions. It does not create a resource, project,
+or model deployment. Management-plane read access and Foundry agent creation
+permission are required. Install the Azure CLI and `uv`, and run the following
+steps in PowerShell from the repository root.
+
+#### 1. Authenticate and configure the project
+
+Replace the placeholders with your Central US resource and project details:
+
+```powershell
+az login
+$env:FOUNDRY_PROJECT_ENDPOINT = 'https://<account>.services.ai.azure.com/api/projects/<project>'
+$account = '/subscriptions/<subscription>/resourceGroups/<group>/providers/Microsoft.CognitiveServices/accounts/<account>'
+$env:AZURE_TOKEN_CREDENTIALS = 'AzureCliCredential' # optional; requires azure-identity >= 1.24
+```
+
+#### 2. Create the agent
+
+Optionally validate the account without creating anything:
+
+```powershell
+uv run --script examples\voice_agents\create_foundry_gpt_live.py `
+  --account-resource-id $account --model-type managed --check-only
+```
+
+`--check-only` validates the account and definition without creating an agent;
+it does not verify model availability or agent-creation permission. Create and
+retain a new agent with:
+
+```powershell
+uv run --script examples\voice_agents\create_foundry_gpt_live.py `
+  --account-resource-id $account --model-type managed
+```
+
+The script prints the agent name and version. Keep the name for the next step.
+Alternatively, create or configure an agent using the
+[Microsoft GPT Live samples](https://github.com/microsoft/voice-agent/tree/main/samples/gpt_live);
+its saved definition must use PCM16 audio at **24000 Hz**.
+
+#### 3. Run the microphone console
+
+Install the project environment, set `AGENT_NAME` to the name printed above, and
+start the console:
+
+```powershell
+uv sync --package livekit-plugins-azure --extra realtime --no-default-groups --group dev
+$env:AGENT_NAME = '<name-printed-by-the-script>'
+uv run --no-sync python examples\voice_agents\foundry_gpt_live.py console
+```
+
+Speak after `Ready to speak.` appears. The environment variables apply to the
+current PowerShell session; no `.env` file is needed. Normal conversation works
+without a tool; to ask for the current time, first configure the schema described
+in **Bind a local Python tool** below.
+
+For an existing agent on macOS or Linux, set the connection variables before
+running the console:
 
 ```bash
 export FOUNDRY_PROJECT_ENDPOINT="https://<resource>.services.ai.azure.com/api/projects/<project>"
 export AGENT_NAME="<saved-voice-agent-name>"
+uv run --no-sync python examples/voice_agents/foundry_gpt_live.py console
 ```
-
-To set these variables directly and run the microphone example in PowerShell,
-from the repository root with the project environment installed:
-
-```powershell
-az login
-$env:FOUNDRY_PROJECT_ENDPOINT = 'https://<resource>.services.ai.azure.com/api/projects/<project>'
-$env:AGENT_NAME = '<saved-voice-agent-name>'
-$env:AZURE_TOKEN_CREDENTIALS = 'AzureCliCredential' # optional; requires azure-identity >= 1.24
-uv run --no-sync python examples\voice_agents\foundry_gpt_live.py console
-```
-
-Replace the placeholders before running. These variables apply to the current
-PowerShell session; no `.env` file is needed. To use the example's local
-function tool, the saved agent also needs the schema described in **Bind a local
-Python tool** below.
 
 Alternatively, you can save these connection settings in
 `examples/voice_agents/.env`. From the repository root, copy the template only

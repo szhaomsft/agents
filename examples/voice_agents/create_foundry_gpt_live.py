@@ -1,7 +1,7 @@
 # /// script
 # dependencies = ["azure-ai-projects>=2.11.0", "azure-identity>=1.25.1"]
 # ///
-"""Create a new Foundry GPT Live agent using existing US Data Zone deployments.
+"""Create a Foundry GPT Live agent using managed or self-deployed Data Zone models.
 
 Run with uv run --script; use --check-only to validate without creating an agent.
 Requires management-plane read access and Foundry agent creation permission.
@@ -20,9 +20,15 @@ from uuid import uuid4
 
 
 def validate_account(
-    account: dict[str, Any], locations: dict[str, Any], project_endpoint: str
+    account: dict[str, Any],
+    locations: dict[str, Any],
+    project_endpoint: str,
+    *,
+    require_central_us: bool = False,
 ) -> None:
     location = account["location"].lower()
+    if require_central_us and location != "centralus":
+        raise ValueError(f"Managed GPT Live requires Central US, not {location!r}")
     us_locations = {
         entry["name"].lower()
         for entry in locations["value"]
@@ -54,6 +60,40 @@ def validate_deployment(deployment: dict[str, Any], *, voice: bool) -> None:
         raise ValueError(f"Voice deployment {name!r} must serve gpt-live-1")
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--project-endpoint", default=os.environ.get("FOUNDRY_PROJECT_ENDPOINT"))
+    parser.add_argument("--account-resource-id", required=True)
+    parser.add_argument(
+        "--model-type", choices=("managed", "self_deployed"), default="self_deployed"
+    )
+    parser.add_argument("--voice-deployment")
+    parser.add_argument("--backend-deployment")
+    parser.add_argument("--check-only", action="store_true")
+    args = parser.parse_args()
+    if not args.project_endpoint:
+        parser.error("Set FOUNDRY_PROJECT_ENDPOINT or pass --project-endpoint")
+    args.account_resource_id = args.account_resource_id.rstrip("/")
+    match = re.fullmatch(
+        r"/subscriptions/([0-9a-fA-F-]+)/resourceGroups/[^/?#]+"
+        r"/providers/Microsoft.CognitiveServices/accounts/[^/?#]+",
+        args.account_resource_id,
+    )
+    if match is None:
+        parser.error("--account-resource-id must be an Azure Cognitive Services account ARM ID")
+    args.subscription_id = match.group(1)
+    if args.model_type == "managed":
+        if args.voice_deployment is not None or args.backend_deployment is not None:
+            parser.error("Managed models do not use --voice-deployment or --backend-deployment")
+    else:
+        if not args.voice_deployment or not args.backend_deployment:
+            parser.error("Self-deployed models require --voice-deployment and --backend-deployment")
+        for name in (args.voice_deployment, args.backend_deployment):
+            if not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+                parser.error("Deployment names must contain only letters, digits, '.', '_' or '-'")
+    return args
+
+
 def main() -> None:
     from azure.ai.projects import AIProjectClient
     from azure.ai.projects.models import (
@@ -66,23 +106,8 @@ def main() -> None:
     )
     from azure.identity import DefaultAzureCredential
 
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--project-endpoint", default=os.environ.get("FOUNDRY_PROJECT_ENDPOINT"))
-    parser.add_argument("--account-resource-id", required=True)
-    parser.add_argument("--voice-deployment", required=True)
-    parser.add_argument("--backend-deployment", required=True)
-    parser.add_argument("--check-only", action="store_true")
-    args = parser.parse_args()
-    resource_id = args.account_resource_id.rstrip("/")
-    match = re.fullmatch(
-        r"/subscriptions/([0-9a-fA-F-]+)/resourceGroups/[^/?#]+"
-        r"/providers/Microsoft.CognitiveServices/accounts/[^/?#]+",
-        resource_id,
-    )
-    if match is None:
-        parser.error("--account-resource-id must be an Azure Cognitive Services account ARM ID")
-    if not args.project_endpoint:
-        parser.error("Set FOUNDRY_PROJECT_ENDPOINT or pass --project-endpoint")
+    args = parse_args()
+    resource_id = args.account_resource_id
 
     with DefaultAzureCredential() as credential:
         token = credential.get_token("https://management.azure.com/.default").token
@@ -97,18 +122,30 @@ def main() -> None:
                 return result
 
         account = read_arm(resource_id)
-        locations = read_arm(f"/subscriptions/{match.group(1)}/locations", api_version="2022-12-01")
-        validate_account(account, locations, args.project_endpoint)
-        for name, voice in ((args.voice_deployment, True), (args.backend_deployment, False)):
-            if not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
-                parser.error("Deployment names must contain only letters, digits, '.', '_' or '-'")
-            deployment = read_arm(f"{resource_id}/deployments/{name}")
-            validate_deployment(deployment, voice=voice)
-            print(f"Verified {name}: {deployment['sku']['name']} in {account['location']}")
+        locations = read_arm(
+            f"/subscriptions/{args.subscription_id}/locations", api_version="2022-12-01"
+        )
+        validate_account(
+            account,
+            locations,
+            args.project_endpoint,
+            require_central_us=args.model_type == "managed",
+        )
+        if args.model_type == "managed":
+            voice_model = "gpt-live-1-datazone"
+            backend_model = "gpt-6-luna"
+            print(f"Verified managed Data Zone setup in {account['location']}")
+        else:
+            for name, voice in ((args.voice_deployment, True), (args.backend_deployment, False)):
+                deployment = read_arm(f"{resource_id}/deployments/{name}")
+                validate_deployment(deployment, voice=voice)
+                print(f"Verified {name}: {deployment['sku']['name']} in {account['location']}")
+            voice_model = args.voice_deployment
+            backend_model = args.backend_deployment
 
         definition = VoiceAgentLiveDefinition(
-            model=args.voice_deployment,
-            model_type="self_deployed",
+            model=voice_model,
+            model_type=args.model_type,
             instructions="Be a helpful, concise voice assistant. Delegate reasoning when needed.",
             audio=LiveInitialSessionAudioParam(
                 format=LiveSessionAudioFormatPCMParam(rate=24000),
@@ -116,7 +153,7 @@ def main() -> None:
             ),
             delegation=VoiceAgentLiveResponsesDelegation(
                 responses=LiveResponsesDelegationSettingsInputParam(
-                    model=args.backend_deployment,
+                    model=backend_model,
                     instructions="Give accurate, concise guidance to the voice assistant.",
                 )
             ),
