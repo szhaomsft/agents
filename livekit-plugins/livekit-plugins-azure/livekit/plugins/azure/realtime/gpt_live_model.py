@@ -31,8 +31,9 @@ class GPTLiveModel(_impl.GPTLiveModel):
     """Connect an existing Foundry GPT Live voice agent to ``AgentSession(llm=...)``.
 
     The agent must have ``kind="voice"``, ``sub_protocol="live"`` and PCM16/24 kHz
-    audio configured in Foundry. Foundry supplies its model, voice, instructions,
-    greeting and delegation backend; this client never sends ``session.start``.
+    audio configured in Foundry. Foundry supplies its model (such as the managed
+    ``gpt-live-1-datazone``), voice, instructions, greeting and delegation backend;
+    this client never sends ``session.start``.
 
     Args:
         project_endpoint: HTTPS project endpoint ending in ``/api/projects/<project>``.

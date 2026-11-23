@@ -30,11 +30,13 @@ below: GPT Live continuously listens and speaks, while Foundry owns its model,
 voice, greeting, instructions and delegation backend.
 
 For this sample, use a Foundry resource and project in **Central US**
-(`centralus`) and select the **managed US Data Zone `gpt-live-1` model**:
-set `model_type="managed"` and `model="gpt-live-1"` in the saved agent definition.
+(`centralus`) and select the **managed US Data Zone `gpt-live-1-datazone` model**:
+set `model_type="managed"` and `model="gpt-live-1-datazone"` in the saved agent definition.
 You do not need to create a customer GPT Live model deployment or allocate
 deployment quota for this managed path. US Data Zone describes the processing
 boundary; it does not mean all inference happens exclusively in Central US.
+The voice model selection alone does not establish the residency of delegated
+work, stored conversations, tools, telemetry, or LiveKit hosting.
 
 For managed Responses delegation in Central US, use a supported backend model
 name such as `gpt-6-luna`, not a customer deployment name. The service currently
@@ -46,7 +48,7 @@ use `foundry_managed_agent` delegation instead. A minimal managed definition is:
   "kind": "voice",
   "sub_protocol": "live",
   "model_type": "managed",
-  "model": "gpt-live-1",
+  "model": "gpt-live-1-datazone",
   "instructions": "Be a concise voice assistant. Delegate questions requiring tools.",
   "audio": {
     "format": {"type": "audio/pcm", "rate": 24000},
@@ -141,6 +143,18 @@ send `session.start`. Nonempty LiveKit `Agent.instructions` are appended as
 additional instructions, not substituted for the saved definition. Initial chat
 history is appended as context. Configure frontend model, voice, and backend
 settings in Foundry rather than passing direct OpenAI deployment options.
+
+To switch an existing managed GPT Live agent to the Data Zone model without
+changing its tools or other settings, run the updater from the repository root.
+It defaults to a dry run:
+
+```powershell
+uv run --no-sync python examples\voice_agents\update_foundry_gpt_live_tool.py --model gpt-live-1-datazone
+```
+
+Review the change, then repeat with `--apply` to create a new agent version.
+If the client pins `agent_version`, update it to the new version. The plugin
+does not change the saved model when it connects.
 
 Set `delegation` to match the saved agent: `"responses"` (default), `"client"`,
 or `"foundry_managed_agent"`. Responses and managed-agent backends support local
@@ -246,7 +260,7 @@ flow described above.
 #### Alternative: create an agent with self-deployed US Data Zone models
 
 The following creation script is for `model_type="self_deployed"`, not the
-managed `gpt-live-1` setup above. For self-deployed models, Data Zone routing is
+managed `gpt-live-1-datazone` setup above. For self-deployed models, Data Zone routing is
 selected by the **model deployment SKU**, not by an agent flag, its name, or a US
 project endpoint alone. The connection example does not change deployment routing.
 
